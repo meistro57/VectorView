@@ -1,0 +1,20 @@
+# Secrets
+.env
+
+# Build artifacts
+vectorview
+vectorview.exe
+*.exe
+
+# Go
+vendor/
+
+# Python (from adjacent tools)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
