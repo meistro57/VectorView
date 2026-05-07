@@ -305,18 +305,23 @@
   <div class="panel-title">⬡ Controls</div>
 
   <div class="ctrl-row">
-    <label>Point Size <span id="val-size">2.5</span></label>
-    <input type="range" id="ctrl-size" min="0.5" max="8" step="0.5" value="2.5">
+    <label>Point Size <span id="val-size">6.0</span></label>
+    <input type="range" id="ctrl-size" min="1" max="12" step="0.1" value="6.0">
   </div>
 
   <div class="ctrl-row">
-    <label>Opacity <span id="val-opacity">0.85</span></label>
-    <input type="range" id="ctrl-opacity" min="0.1" max="1" step="0.05" value="0.85">
+    <label>Core Opacity <span id="val-core-opacity">0.85</span></label>
+    <input type="range" id="ctrl-core-opacity" min="0.1" max="1" step="0.05" value="0.85">
   </div>
 
   <div class="ctrl-row">
-    <label>Bloom Strength <span id="val-bloom">1.2</span></label>
-    <input type="range" id="ctrl-bloom" min="0" max="3" step="0.1" value="1.2">
+    <label>Bloom <span id="val-bloom">2.5</span></label>
+    <input type="range" id="ctrl-bloom" min="0" max="4" step="0.1" value="2.5">
+  </div>
+
+  <div class="ctrl-row">
+    <label>Haze Opacity <span id="val-haze-opacity">0.55</span></label>
+    <input type="range" id="ctrl-haze-opacity" min="0" max="1" step="0.05" value="0.55">
   </div>
 
   <div class="ctrl-row">
@@ -474,15 +479,20 @@ class OrbitControls {
 // ── State ─────────────────────────────────────────────────────────────────────
 let scene, camera, renderer, controls;
 let particleSystem = null;
+let hazeSystem = null;
 let glowSystem = null;
+let nebulaSystem = null;
 let allPoints = [];
 let currentCollection = 'meistro_brain';
 let animAutoRotate = true;
-let bloomStrength = 1.2;
+let pointSize = 6.0;
+let coreOpacity = 0.85;
+let hazeOpacity = 0.55;
+let bloomStrength = 2.5;
 let rotSpeed = 0.2;
 let hovered = -1;
 const raycaster = new THREE.Raycaster();
-raycaster.params.Points.threshold = 1.2;
+raycaster.params.Points.threshold = 3.0;
 const mouse = new THREE.Vector2(-9999, -9999);
 
 // Color palette per cluster bucket
@@ -498,7 +508,7 @@ function initScene() {
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x050508);
-  scene.fog = new THREE.FogExp2(0x050508, 0.0008);
+  scene.fog = new THREE.FogExp2(0x050508, 0.0003);
 
   camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 5000);
   camera.position.set(0, 0, 300);
@@ -568,16 +578,27 @@ function onClick(e) {
 }
 
 // ── Build particle cloud ──────────────────────────────────────────────────────
+function extractClusterKey(point) {
+  const source = (point.payload?.file_source ?? '').toString();
+  if (!source) return 'unknown';
+  const prefix = source.split('_')[0];
+  const match = prefix.match(/^(\d+)/);
+  if (match) return match[1];
+  return prefix || 'unknown';
+}
+
 function buildParticles(points) {
-  if (particleSystem) { scene.remove(particleSystem); particleSystem.geometry.dispose(); particleSystem.material.dispose(); }
-  if (glowSystem)     { scene.remove(glowSystem);     glowSystem.geometry.dispose();     glowSystem.material.dispose(); }
+  if (particleSystem) { scene.remove(particleSystem); particleSystem.material.dispose(); }
+  if (hazeSystem)     { scene.remove(hazeSystem);     hazeSystem.material.dispose(); }
+  if (glowSystem)     { scene.remove(glowSystem);     glowSystem.material.dispose(); }
+  if (nebulaSystem)   { scene.remove(nebulaSystem);   nebulaSystem.material.dispose(); }
+  if (particleSystem) { particleSystem.geometry.dispose(); }
 
   const n = points.length;
   const positions = new Float32Array(n * 3);
   const colors    = new Float32Array(n * 3);
   const sizes     = new Float32Array(n);
 
-  // Normalise XYZ to fit in ±100
   let minX = Infinity, maxX = -Infinity;
   let minY = Infinity, maxY = -Infinity;
   let minZ = Infinity, maxZ = -Infinity;
@@ -591,12 +612,14 @@ function buildParticles(points) {
   const rangeZ = maxZ - minZ || 1;
   const scale = 200;
 
-  // Cluster by entity_type or source_id bucket
   const clusterMap = new Map();
   let clusterIdx = 0;
   for (const p of points) {
-    const key = (p.payload?.entity_type || p.payload?.source_id || 'unknown').toString().slice(0, 20);
-    if (!clusterMap.has(key)) { clusterMap.set(key, clusterIdx++); }
+    const key = extractClusterKey(p);
+    if (!clusterMap.has(key)) {
+      clusterMap.set(key, { index: clusterIdx++, count: 0 });
+    }
+    clusterMap.get(key).count++;
   }
 
   const c = new THREE.Color();
@@ -606,106 +629,179 @@ function buildParticles(points) {
     positions[i*3+1] = ((p.y - minY) / rangeY - 0.5) * scale;
     positions[i*3+2] = ((p.z - minZ) / rangeZ - 0.5) * scale;
 
-    const key = (p.payload?.entity_type || p.payload?.source_id || 'unknown').toString().slice(0, 20);
-    const ci  = clusterMap.get(key) % PALETTE.length;
+    const key = extractClusterKey(p);
+    const ci  = clusterMap.get(key).index % PALETTE.length;
     c.setHex(PALETTE[ci]);
     colors[i*3] = c.r; colors[i*3+1] = c.g; colors[i*3+2] = c.b;
 
-    sizes[i] = 2.5;
+    sizes[i] = pointSize;
   }
 
-  // Main particle geo
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geo.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
   geo.setAttribute('size',     new THREE.BufferAttribute(sizes, 1));
 
-  const mat = new THREE.ShaderMaterial({
-    uniforms: {
-      uTime:    { value: 0 },
-      uOpacity: { value: 0.85 },
-      uBloom:   { value: 1.2 },
-    },
-    vertexShader: `
+  const VERT = `
       attribute float size;
-      attribute vec3 color;
       varying vec3 vColor;
-      varying float vDist;
       uniform float uTime;
+      uniform float uSizeMult;
       void main() {
         vColor = color;
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        vDist = -mv.z;
-        float pulse = 1.0 + 0.08 * sin(uTime * 2.0 + position.x * 0.05);
-        gl_PointSize = size * pulse * (300.0 / vDist);
-        gl_Position = projectionMatrix * mv;
+        float vDist = -mv.z;
+        float pulse = 1.0 + 0.12 * sin(uTime * 1.8 + position.x * 0.07 + position.z * 0.05);
+        gl_PointSize = size * uSizeMult * pulse * (400.0 / max(vDist, 1.0));
+        gl_PointSize = clamp(gl_PointSize, 1.0, 512.0);
+        gl_Position  = projectionMatrix * mv;
       }
-    `,
-    fragmentShader: `
+    `;
+
+  const CORE_FRAG = `
       varying vec3 vColor;
-      varying float vDist;
       uniform float uOpacity;
       uniform float uBloom;
       void main() {
         vec2 uv = gl_PointCoord - 0.5;
         float d = length(uv);
         if (d > 0.5) discard;
-        float core  = smoothstep(0.5, 0.0, d);
-        float glow  = pow(core, 1.5) * uBloom;
-        vec3  col   = vColor * (core + glow);
-        float alpha = core * uOpacity;
+
+        float coreMask = 1.0 - smoothstep(0.17, 0.19, d);
+        float ringMask = smoothstep(0.18, 0.20, d) * (1.0 - smoothstep(0.45, 0.47, d));
+        float rimMask = smoothstep(0.45, 0.47, d) * (1.0 - smoothstep(0.50, 0.51, d));
+
+        vec3 coreCol = vec3(1.0) * uBloom;
+        vec3 ringCol = mix(vColor, vec3(1.0), 0.65) * uBloom;
+        vec3 rimCol = vColor * 0.5;
+
+        vec3 col = coreCol * coreMask + ringCol * ringMask + rimCol * rimMask;
+        float alpha = (coreMask + ringMask + rimMask * 0.8) * uOpacity;
         gl_FragColor = vec4(col, alpha);
       }
-    `,
+    `;
+
+  const HAZE_FRAG = `
+      varying vec3 vColor;
+      uniform float uOpacity;
+      uniform float uBloom;
+      void main() {
+        vec2 uv = gl_PointCoord - 0.5;
+        float d = length(uv);
+        if (d > 0.5) discard;
+        float emit = pow(max(1.0 - d * 2.0, 0.0), 2.2);
+        vec3 col = vColor * emit * uBloom;
+        gl_FragColor = vec4(col, emit * uOpacity);
+      }
+    `;
+
+  const GLOW_FRAG = `
+      varying vec3 vColor;
+      uniform float uOpacity;
+      uniform float uBloom;
+      void main() {
+        vec2 uv = gl_PointCoord - 0.5;
+        float d = length(uv);
+        if (d > 0.5) discard;
+        float g = exp(-d * d * 14.0);
+        vec3 col = vColor * g * uBloom;
+        gl_FragColor = vec4(col, g * uOpacity);
+      }
+    `;
+
+  const NEBULA_FRAG = `
+      varying vec3 vColor;
+      uniform float uOpacity;
+      uniform float uBloom;
+      void main() {
+        vec2 uv = gl_PointCoord - 0.5;
+        float d = length(uv);
+        if (d > 0.5) discard;
+        float g = exp(-d * d * 4.0);
+        vec3 col = vColor * g * uBloom;
+        gl_FragColor = vec4(col, g * uOpacity);
+      }
+    `;
+
+  const createLayerMaterial = (fragmentShader, opacity, bloom, sizeMult) => new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uOpacity: { value: opacity },
+      uBloom: { value: bloom },
+      uSizeMult: { value: sizeMult },
+    },
+    vertexShader: VERT,
+    fragmentShader,
     transparent: true,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
     vertexColors: true,
   });
 
-  particleSystem = new THREE.Points(geo, mat);
+  particleSystem = new THREE.Points(geo, createLayerMaterial(CORE_FRAG, coreOpacity, bloomStrength, 1.0));
+  hazeSystem = new THREE.Points(geo, createLayerMaterial(HAZE_FRAG, hazeOpacity, 1.8 * (bloomStrength / 2.5), 5.0));
+  glowSystem = new THREE.Points(geo, createLayerMaterial(GLOW_FRAG, 0.18, 1.0 * (bloomStrength / 2.5), 14.0));
+  nebulaSystem = new THREE.Points(geo, createLayerMaterial(NEBULA_FRAG, 0.06, 1.0 * (bloomStrength / 2.5), 30.0));
+
+  scene.add(nebulaSystem);
+  scene.add(glowSystem);
+  scene.add(hazeSystem);
   scene.add(particleSystem);
 
-  // Glow layer (bigger, dimmer)
-  const glowGeo = geo.clone();
-  const glowMat = new THREE.ShaderMaterial({
-    uniforms: { uTime: { value: 0 }, uOpacity: { value: 0.15 }, uBloom: { value: 0.8 } },
-    vertexShader: mat.vertexShader,
-    fragmentShader: mat.fragmentShader,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    vertexColors: true,
-  });
-  // scale glow sizes
-  const glowSizes = new Float32Array(n);
-  for (let i = 0; i < n; i++) glowSizes[i] = sizes[i] * 3.5;
-  glowGeo.setAttribute('size', new THREE.BufferAttribute(glowSizes, 1));
-  glowSystem = new THREE.Points(glowGeo, glowMat);
-  scene.add(glowSystem);
-
-  // Build legend
   buildLegend(clusterMap);
 
-  // Stats
   document.getElementById('stat-points').textContent  = n.toLocaleString();
   document.getElementById('stat-visible').textContent = n.toLocaleString();
   document.getElementById('stat-collection').textContent = currentCollection;
 
   allPoints = points;
+  autoFitCamera();
+}
+
+function autoFitCamera() {
+  if (!camera || !controls || !particleSystem) return;
+
+  particleSystem.geometry.computeBoundingBox();
+  const box = particleSystem.geometry.boundingBox;
+  if (!box) return;
+
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const radius = Math.max(size.length() * 0.5, 1);
+
+  controls.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(0, 0, radius * 2.5));
+  camera.near = Math.max(0.1, radius / 100);
+  camera.far = Math.max(5000, radius * 20);
+  camera.updateProjectionMatrix();
+
+  if (typeof controls._updateSpherical === 'function') {
+    controls._updateSpherical();
+  }
 }
 
 function buildLegend(clusterMap) {
   const el = document.getElementById('legend');
   el.innerHTML = '';
-  let i = 0;
-  for (const [key, idx] of clusterMap) {
-    if (i++ > 9) { el.innerHTML += `<div style="color:var(--dim);font-size:0.6rem">…${clusterMap.size - 9} more</div>`; break; }
-    const color = '#' + PALETTE[idx % PALETTE.length].toString(16).padStart(6, '0');
+
+  const sorted = Array.from(clusterMap.entries())
+    .sort((a, b) => b[1].count - a[1].count);
+
+  const top = sorted.slice(0, 10);
+  for (const [key, meta] of top) {
+    const color = '#' + PALETTE[meta.index % PALETTE.length].toString(16).padStart(6, '0');
     el.innerHTML += `<div class="legend-item">
       <div class="legend-dot" style="background:${color};box-shadow:0 0 6px ${color}"></div>
-      <span style="color:var(--text)">${key}</span>
+      <span style="color:var(--text)">${key} <span style="color:var(--dim)">(${meta.count})</span></span>
     </div>`;
+  }
+
+  const remaining = sorted.length - top.length;
+  if (remaining > 0) {
+    el.innerHTML += `<div style="color:var(--dim);font-size:0.6rem">…${remaining} more</div>`;
   }
 }
 
@@ -778,8 +874,14 @@ function animate() {
   if (particleSystem) {
     particleSystem.material.uniforms.uTime.value = now * 0.001;
   }
+  if (hazeSystem) {
+    hazeSystem.material.uniforms.uTime.value = now * 0.001;
+  }
   if (glowSystem) {
     glowSystem.material.uniforms.uTime.value = now * 0.001;
+  }
+  if (nebulaSystem) {
+    nebulaSystem.material.uniforms.uTime.value = now * 0.001;
   }
 
   renderer.render(scene, camera);
@@ -837,28 +939,38 @@ async function doSearch() {
 function wireControls() {
   document.getElementById('ctrl-size').addEventListener('input', e => {
     const v = parseFloat(e.target.value);
-    document.getElementById('val-size').textContent = v;
+    pointSize = v;
+    document.getElementById('val-size').textContent = v.toFixed(1);
     if (particleSystem) {
       const sizes = particleSystem.geometry.attributes.size.array;
       sizes.fill(v);
       particleSystem.geometry.attributes.size.needsUpdate = true;
-      const gs = glowSystem.geometry.attributes.size.array;
-      gs.fill(v * 3.5);
-      glowSystem.geometry.attributes.size.needsUpdate = true;
     }
   });
 
-  document.getElementById('ctrl-opacity').addEventListener('input', e => {
+  document.getElementById('ctrl-core-opacity').addEventListener('input', e => {
     const v = parseFloat(e.target.value);
-    document.getElementById('val-opacity').textContent = v;
+    coreOpacity = v;
+    document.getElementById('val-core-opacity').textContent = v.toFixed(2);
     if (particleSystem) particleSystem.material.uniforms.uOpacity.value = v;
   });
 
   document.getElementById('ctrl-bloom').addEventListener('input', e => {
     const v = parseFloat(e.target.value);
-    document.getElementById('val-bloom').textContent = v;
+    bloomStrength = v;
+    document.getElementById('val-bloom').textContent = v.toFixed(1);
+    const bloomScale = v / 2.5;
     if (particleSystem) particleSystem.material.uniforms.uBloom.value = v;
-    if (glowSystem)     glowSystem.material.uniforms.uBloom.value = v * 0.6;
+    if (hazeSystem)     hazeSystem.material.uniforms.uBloom.value = 1.8 * bloomScale;
+    if (glowSystem)     glowSystem.material.uniforms.uBloom.value = 1.0 * bloomScale;
+    if (nebulaSystem)   nebulaSystem.material.uniforms.uBloom.value = 1.0 * bloomScale;
+  });
+
+  document.getElementById('ctrl-haze-opacity').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    hazeOpacity = v;
+    document.getElementById('val-haze-opacity').textContent = v.toFixed(2);
+    if (hazeSystem) hazeSystem.material.uniforms.uOpacity.value = v;
   });
 
   document.getElementById('ctrl-speed').addEventListener('input', e => {

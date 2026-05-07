@@ -10,7 +10,7 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 
 - [x] Go binary with embedded frontend via `//go:embed`
 - [x] Qdrant paginated scroll — pulls full collections with vectors
-- [x] Pure Go PCA (power iteration) — N-dim → 3D, zero Python dependency
+- [x] Hybrid PCA pipeline — Python GPU worker for full collections + inline Go power-iteration PCA for filtered search results
 - [x] Three.js r128 particle cloud with custom GLSL shaders
 - [x] Additive blending + dual-layer bloom (core + glow)
 - [x] Pulsing vertex animation driven by `uTime` uniform
@@ -25,9 +25,9 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 
 ## 🔧 v0.2 — Stability & Polish
 
-- [ ] **`go.sum` generation** — ensure clean `go mod tidy` on fresh clone
-- [ ] **`.gitignore`** — exclude `.env`, binary, `__pycache__`
-- [ ] **`.env.example`** — committed template with all vars documented
+- [x] **`go.sum` generation** — ensure clean `go mod tidy` on fresh clone
+- [x] **`.gitignore`** — exclude `.env`, binary, `__pycache__`
+- [x] **`.env.example`** — committed template with all vars documented
 - [ ] **Error overlay in UI** — friendly message when Qdrant is unreachable
 - [ ] **Loading progress bar** — show % of points loaded during scroll
 - [ ] **Empty collection handling** — graceful state instead of blank canvas

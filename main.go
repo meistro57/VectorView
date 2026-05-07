@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -30,17 +31,20 @@ type qdrantClient struct {
 }
 
 type scrollRequest struct {
-	Limit        int      `json:"limit"`
-	WithPayload  bool     `json:"with_payload"`
-	WithVectors  bool     `json:"with_vectors"`
-	Offset       *uint64  `json:"offset,omitempty"`
+	Limit       int         `json:"limit"`
+	WithPayload bool        `json:"with_payload"`
+	WithVectors bool        `json:"with_vectors"`
+	Offset      interface{} `json:"offset,omitempty"`
 }
 
 type scrollResult struct {
-	Result struct {
-		Points    []QPoint `json:"points"`
-		NextPage  *uint64  `json:"next_page_offset"`
-	} `json:"result"`
+	Result *scrollResultInner `json:"result"`
+	Status string             `json:"status"`
+}
+
+type scrollResultInner struct {
+	Points   []QPoint    `json:"points"`
+	NextPage interface{} `json:"next_page_offset"`
 }
 
 type QPoint struct {
@@ -98,13 +102,16 @@ func newQdrant(base, key string) *qdrantClient {
 	if base == "" {
 		base = "http://localhost:6333"
 	}
-	return &qdrantClient{base: base, key: key, http: &http.Client{Timeout: 60 * time.Second}}
+	return &qdrantClient{base: base, key: key, http: &http.Client{Timeout: 120 * time.Second}}
 }
 
 func (q *qdrantClient) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
 	var r io.Reader
 	if body != nil {
-		b, _ := json.Marshal(body)
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("marshal: %w", err)
+		}
 		r = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, q.base+path, r)
@@ -131,9 +138,9 @@ func (q *qdrantClient) listCollections(ctx context.Context) ([]string, error) {
 	}
 	var res collectionsListResult
 	if err := json.Unmarshal(raw, &res); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listCollections decode: %w — body: %s", err, string(raw))
 	}
-	names := make([]string, 0, len(res.Result.Collections))
+	names := make([]string, 0)
 	for _, c := range res.Result.Collections {
 		names = append(names, c.Name)
 	}
@@ -147,7 +154,7 @@ func (q *qdrantClient) collectionMeta(ctx context.Context, name string) (Collect
 	}
 	var info collectionInfo
 	if err := json.Unmarshal(raw, &info); err != nil {
-		return CollectionMeta{}, err
+		return CollectionMeta{}, fmt.Errorf("collectionMeta decode: %w", err)
 	}
 	return CollectionMeta{
 		Name:        name,
@@ -156,166 +163,59 @@ func (q *qdrantClient) collectionMeta(ctx context.Context, name string) (Collect
 	}, nil
 }
 
-// scrollAll fetches up to maxPoints from the collection using pagination
-func (q *qdrantClient) scrollAll(ctx context.Context, collection string, maxPoints int) ([]QPoint, error) {
-	var all []QPoint
-	var offset *uint64
-	pageSize := 256
-	if maxPoints < pageSize {
-		pageSize = maxPoints
-	}
+// ── GPU PCA via Python subprocess ─────────────────────────────────────────────
 
-	for {
-		req := scrollRequest{
-			Limit:       pageSize,
-			WithPayload: true,
-			WithVectors: true,
-			Offset:      offset,
+// pythonBin returns the best available python binary
+func pythonBin() string {
+	for _, candidate := range []string{"python3", "python"} {
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path
 		}
-		raw, _, err := q.do(ctx, http.MethodPost, "/collections/"+collection+"/points/scroll", req)
-		if err != nil {
-			return nil, fmt.Errorf("scroll: %w", err)
-		}
-		var res scrollResult
-		if err := json.Unmarshal(raw, &res); err != nil {
-			return nil, fmt.Errorf("scroll decode: %w", err)
-		}
-		all = append(all, res.Result.Points...)
-		if res.Result.NextPage == nil || len(all) >= maxPoints {
-			break
-		}
-		offset = res.Result.NextPage
 	}
-
-	if len(all) > maxPoints {
-		all = all[:maxPoints]
-	}
-	return all, nil
+	return "python3"
 }
 
-// ── PCA: project N-dim vectors → 3D ──────────────────────────────────────────
-
-func pca3D(points []QPoint) []PointData {
-	n := len(points)
-	if n == 0 {
-		return nil
-	}
-	dim := len(points[0].Vector)
-	if dim == 0 {
-		return nil
-	}
-
-	// Center
-	mean := make([]float64, dim)
-	for _, p := range points {
-		for i, v := range p.Vector {
-			mean[i] += v
+// pcaScript returns the path to pca_gpu.py (same dir as binary, or cwd)
+func pcaScript() string {
+	// Try next to the executable first
+	exe, err := os.Executable()
+	if err == nil {
+		candidate := strings.TrimSuffix(exe, "/vectorview") + "/pca_gpu.py"
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
 		}
 	}
-	for i := range mean {
-		mean[i] /= float64(n)
-	}
-
-	centered := make([][]float64, n)
-	for i, p := range points {
-		row := make([]float64, dim)
-		for j, v := range p.Vector {
-			row[j] = v - mean[j]
-		}
-		centered[i] = row
-	}
-
-	// Power iteration for top 3 principal components
-	comps := powerIteration(centered, n, dim, 3, 60)
-
-	out := make([]PointData, n)
-	for i, row := range centered {
-		pd := PointData{
-			ID:      points[i].ID,
-			Payload: points[i].Payload,
-		}
-		if len(comps) > 0 {
-			pd.X = dot(row, comps[0])
-		}
-		if len(comps) > 1 {
-			pd.Y = dot(row, comps[1])
-		}
-		if len(comps) > 2 {
-			pd.Z = dot(row, comps[2])
-		}
-		out[i] = pd
-	}
-	return out
+	// Fall back to cwd
+	return "pca_gpu.py"
 }
 
-func powerIteration(data [][]float64, n, dim, k, iters int) [][]float64 {
-	comps := make([][]float64, 0, k)
-	deflated := make([][]float64, n)
-	for i := range deflated {
-		deflated[i] = append([]float64{}, data[i]...)
+// runGPUPCA calls pca_gpu.py and returns projected PointData
+func runGPUPCA(collection string, limit int, qdrantURL string) ([]PointData, error) {
+	py := pythonBin()
+	script := pcaScript()
+
+	log.Printf("GPU PCA: %s %s %s %d %s", py, script, collection, limit, qdrantURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, py, script,
+		collection,
+		strconv.Itoa(limit),
+		qdrantURL,
+	)
+	cmd.Stderr = os.Stderr // stream [pca_gpu] logs to terminal
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("pca_gpu.py failed: %w", err)
 	}
 
-	for c := 0; c < k; c++ {
-		v := make([]float64, dim)
-		v[c%dim] = 1.0
-
-		for iter := 0; iter < iters; iter++ {
-			// Av = data^T * (data * v)
-			tmp := make([]float64, n)
-			for i, row := range deflated {
-				tmp[i] = dot(row, v)
-			}
-			newV := make([]float64, dim)
-			for i, row := range deflated {
-				for j := range newV {
-					newV[j] += tmp[i] * row[j]
-				}
-			}
-			norm := 0.0
-			for _, x := range newV {
-				norm += x * x
-			}
-			norm = sqrt64(norm)
-			if norm < 1e-10 {
-				break
-			}
-			for j := range newV {
-				newV[j] /= norm
-			}
-			v = newV
-		}
-		comps = append(comps, v)
-
-		// Deflate
-		for i, row := range deflated {
-			proj := dot(row, v)
-			for j := range row {
-				deflated[i][j] -= proj * v[j]
-			}
-		}
+	var resp PointsResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return nil, fmt.Errorf("pca_gpu.py bad JSON: %w — output: %.300s", err, string(out))
 	}
-	return comps
-}
-
-func dot(a, b []float64) float64 {
-	s := 0.0
-	for i := range a {
-		if i < len(b) {
-			s += a[i] * b[i]
-		}
-	}
-	return s
-}
-
-func sqrt64(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	z := x
-	for i := 0; i < 50; i++ {
-		z = (z + x/z) / 2
-	}
-	return z
+	return resp.Points, nil
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
@@ -325,7 +225,7 @@ func main() {
 
 	qdrantURL := envOr("QDRANT_URL", "http://localhost:6333")
 	qdrantKey := os.Getenv("QDRANT_API_KEY")
-	port := envOr("VECTORVIEW_PORT", "7433")
+	port      := envOr("VECTORVIEW_PORT", "7433")
 	maxPoints, _ := strconv.Atoi(envOr("VECTORVIEW_MAX_POINTS", "2000"))
 	if maxPoints <= 0 {
 		maxPoints = 2000
@@ -333,7 +233,6 @@ func main() {
 
 	q := newQdrant(qdrantURL, qdrantKey)
 
-	// Serve embedded static files
 	staticSub, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		log.Fatal(err)
@@ -342,15 +241,16 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
 
-	// GET /api/collections → list all collections
+	// GET /api/collections
 	mux.HandleFunc("/api/collections", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
 		names, err := q.listCollections(r.Context())
 		if err != nil {
+			log.Printf("ERROR listCollections: %v", err)
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		metas := make([]CollectionMeta, 0, len(names))
+		metas := make([]CollectionMeta, 0)
 		for _, name := range names {
 			m, err := q.collectionMeta(r.Context(), name)
 			if err == nil {
@@ -360,7 +260,8 @@ func main() {
 		json.NewEncoder(w).Encode(metas)
 	})
 
-	// GET /api/points?collection=meistro_brain&limit=2000
+	// GET /api/points?collection=X&limit=N
+	// Delegates fetch+PCA to pca_gpu.py
 	mux.HandleFunc("/api/points", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
 		collection := r.URL.Query().Get("collection")
@@ -374,39 +275,39 @@ func main() {
 			}
 		}
 
-		raw, err := q.scrollAll(r.Context(), collection, limit)
+		log.Printf("→ /api/points collection=%s limit=%d", collection, limit)
+		points, err := runGPUPCA(collection, limit, qdrantURL)
 		if err != nil {
+			log.Printf("ERROR runGPUPCA: %v", err)
 			http.Error(w, err.Error(), 500)
 			return
 		}
 
-		projected := pca3D(raw)
-		resp := PointsResponse{Points: projected, Total: len(projected)}
+		resp := PointsResponse{Points: points, Total: len(points)}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
 
-	// GET /api/search?collection=meistro_brain&q=consciousness&limit=10
+	// GET /api/search?collection=X&q=term&limit=N
+	// Payload keyword filter → GPU PCA on results
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
-		// Returns payload-only matches (text search via filter)
 		collection := r.URL.Query().Get("collection")
 		if collection == "" {
 			collection = "meistro_brain"
 		}
 		queryStr := r.URL.Query().Get("q")
-		limitStr := r.URL.Query().Get("limit")
-		limit := 10
-		if lv, err := strconv.Atoi(limitStr); err == nil && lv > 0 {
+		limit := 500
+		if lv, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && lv > 0 {
 			limit = lv
 		}
 
-		// Use scroll with payload text filter (keyword match in text field)
+		type matchValue struct {
+			Text string `json:"text"`
+		}
 		type filterMatch struct {
-			Key   string `json:"key"`
-			Match struct {
-				Text string `json:"text"`
-			} `json:"match"`
+			Key   string     `json:"key"`
+			Match matchValue `json:"match"`
 		}
 		type filterClause struct {
 			Should []filterMatch `json:"should"`
@@ -418,29 +319,39 @@ func main() {
 			WithVectors bool         `json:"with_vectors"`
 		}
 
-		fm := filterMatch{Key: "text"}
-		fm.Match.Text = queryStr
-		fm2 := filterMatch{Key: "content"}
-		fm2.Match.Text = queryStr
-		fm3 := filterMatch{Key: "chunk_text"}
-		fm3.Match.Text = queryStr
-
 		sreq := searchReq{
-			Filter:      filterClause{Should: []filterMatch{fm, fm2, fm3}},
+			Filter: filterClause{Should: []filterMatch{
+				{Key: "text",       Match: matchValue{Text: queryStr}},
+				{Key: "content",    Match: matchValue{Text: queryStr}},
+				{Key: "chunk_text", Match: matchValue{Text: queryStr}},
+				{Key: "title",      Match: matchValue{Text: queryStr}},
+			}},
 			Limit:       limit,
 			WithPayload: true,
 			WithVectors: true,
 		}
 
-		raw2, _, err := q.do(r.Context(), http.MethodPost,
+		raw, status, err := q.do(r.Context(), http.MethodPost,
 			"/collections/"+collection+"/points/scroll", sreq)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		if status >= 400 {
+			http.Error(w, fmt.Sprintf("qdrant %d: %s", status, string(raw)), 500)
+			return
+		}
+
 		var res scrollResult
-		json.Unmarshal(raw2, &res)
-		projected := pca3D(res.Result.Points)
+		json.Unmarshal(raw, &res)
+
+		// Re-project the filtered points via inline Go PCA
+		// (search results are small enough — no need for GPU subprocess)
+		var pts []QPoint
+		if res.Result != nil {
+			pts = res.Result.Points
+		}
+		projected := goPCA3D(pts)
 		resp := PointsResponse{Points: projected, Total: len(projected)}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -448,14 +359,139 @@ func main() {
 
 	addr := ":" + port
 	log.Printf("🚀 VectorView running → http://localhost%s", addr)
-	log.Printf("   Qdrant: %s | Max points: %d", qdrantURL, maxPoints)
+	log.Printf("   Qdrant: %s | GPU PCA script: %s | Max points: %d", qdrantURL, pcaScript(), maxPoints)
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// ── Inline Go PCA for small search result sets ────────────────────────────────
+
+func goPCA3D(points []QPoint) []PointData {
+	valid := make([]QPoint, 0, len(points))
+	for _, p := range points {
+		if len(p.Vector) > 0 {
+			valid = append(valid, p)
+		}
 	}
+	n := len(valid)
+	if n == 0 {
+		return nil
+	}
+	dim := len(valid[0].Vector)
+
+	mean := make([]float64, dim)
+	for _, p := range valid {
+		for i, v := range p.Vector {
+			mean[i] += v
+		}
+	}
+	for i := range mean {
+		mean[i] /= float64(n)
+	}
+
+	centered := make([][]float64, n)
+	for i, p := range valid {
+		row := make([]float64, dim)
+		for j, v := range p.Vector {
+			row[j] = v - mean[j]
+		}
+		centered[i] = row
+	}
+
+	comps := powerIteration(centered, n, dim, 3, 20)
+
+	// Project
+	coords := make([][3]float64, n)
+	for i, row := range centered {
+		for c, comp := range comps {
+			if c < 3 {
+				coords[i][c] = dotProduct(row, comp)
+			}
+		}
+	}
+
+	// Normalize each axis to [-100, 100]
+	for axis := 0; axis < 3; axis++ {
+		mn, mx := coords[0][axis], coords[0][axis]
+		for i := 1; i < n; i++ {
+			if coords[i][axis] < mn { mn = coords[i][axis] }
+			if coords[i][axis] > mx { mx = coords[i][axis] }
+		}
+		r := mx - mn
+		for i := range coords {
+			if r < 1e-8 {
+				coords[i][axis] = 0
+			} else {
+				coords[i][axis] = ((coords[i][axis]-mn)/r - 0.5) * 200.0
+			}
+		}
+	}
+
+	out := make([]PointData, n)
+	for i, p := range valid {
+		out[i] = PointData{
+			ID:      p.ID,
+			X:       coords[i][0],
+			Y:       coords[i][1],
+			Z:       coords[i][2],
+			Payload: p.Payload,
+		}
+	}
+	return out
+}
+
+func powerIteration(data [][]float64, n, dim, k, iters int) [][]float64 {
+	comps := make([][]float64, 0, k)
+	deflated := make([][]float64, n)
+	for i := range deflated {
+		deflated[i] = append([]float64{}, data[i]...)
+	}
+	for c := 0; c < k; c++ {
+		v := make([]float64, dim)
+		v[c%dim] = 1.0
+		for iter := 0; iter < iters; iter++ {
+			tmp := make([]float64, n)
+			for i, row := range deflated {
+				tmp[i] = dotProduct(row, v)
+			}
+			newV := make([]float64, dim)
+			for i, row := range deflated {
+				for j := range newV {
+					newV[j] += tmp[i] * row[j]
+				}
+			}
+			norm := 0.0
+			for _, x := range newV { norm += x * x }
+			norm = goSqrt(norm)
+			if norm < 1e-10 { break }
+			for j := range newV { newV[j] /= norm }
+			v = newV
+		}
+		comps = append(comps, v)
+		for i, row := range deflated {
+			proj := dotProduct(row, v)
+			for j := range row { deflated[i][j] -= proj * v[j] }
+		}
+	}
+	return comps
+}
+
+func dotProduct(a, b []float64) float64 {
+	s := 0.0
+	for i := range a {
+		if i < len(b) { s += a[i] * b[i] }
+	}
+	return s
+}
+
+func goSqrt(x float64) float64 {
+	if x <= 0 { return 0 }
+	z := x
+	for i := 0; i < 50; i++ { z = (z + x/z) / 2 }
+	return z
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" { return v }
 	return def
 }
 

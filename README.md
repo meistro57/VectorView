@@ -20,7 +20,7 @@
 
 ---
 
-VectorView is a **zero-dependency Go binary** that turns your [Qdrant](https://qdrant.tech) vector collections into a live, interactive **3D particle universe** — rendered in the browser with Three.js and a custom GLSL shader engine. No Python runtime. No Node.js build step. No config hell. One binary, one port, one command.
+VectorView is a **Go-first local app** that turns your [Qdrant](https://qdrant.tech) vector collections into a live, interactive **3D particle universe** — rendered in the browser with Three.js and a custom GLSL shader engine. The server is a single Go binary with an optional Python PCA worker for fast large-collection projection. No Node.js build step. No config hell. One command, one port, instant visualization.
 
 It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) / Knowledge Archaeology Engine ecosystem as a way to *see* what's actually living inside a vector database — not just query it blindly, but watch clusters form, spot outliers, and navigate latent space like a physical territory.
 
@@ -32,7 +32,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 
 **Visualization**
 - Live 3D particle cloud rendered via custom WebGL shaders — additive blending, pulsing glow, dual-layer bloom
-- Pure Go PCA (power iteration) — projects N-dimensional vectors to 3D with zero Python dependency
+- Hybrid PCA pipeline: `/api/points` uses `pca_gpu.py` (PyTorch/CuPy/NumPy), `/api/search` uses inline Go PCA for smaller result sets
 - Color-coded clusters by `entity_type`, `source_id`, or any payload field
 - Exponential fog, starfield background, and a subtle grid anchor the scene in deep space
 
@@ -49,7 +49,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 
 **Architecture**
 - Single Go binary with `//go:embed` — ships the entire frontend inside the executable
-- Paginated Qdrant scroll — handles large collections gracefully (configurable limit)
+- Python PCA worker (`pca_gpu.py`) for full-collection projection with GPU/CPU fallbacks
 - Raw HTTP Qdrant client — no SDK bloat, same pattern as meta_bridge
 - `.env` support via `godotenv` — drop your existing config and go
 
@@ -60,6 +60,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 ### Prerequisites
 
 - [Go 1.22+](https://golang.org/dl/)
+- [Python 3.9+](https://www.python.org/downloads/) with `numpy` installed (`torch`/`cupy` optional for GPU acceleration)
 - [Qdrant](https://qdrant.tech) running locally (default: `http://localhost:6333`)
 - A populated collection to explore
 
@@ -69,6 +70,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 git clone https://github.com/meistro57/VectorView.git
 cd VectorView
 go mod tidy
+python3 -m pip install numpy
 go run .
 ```
 
@@ -138,14 +140,11 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 
 ## 🧠 How the 3D Projection Works
 
-VectorView implements **Principal Component Analysis via power iteration** entirely in Go — no cgo, no native libs, no Python subprocess.
+VectorView uses a **hybrid PCA pipeline**:
 
-1. **Scroll** — all points are fetched from Qdrant with `with_vectors: true`
-2. **Center** — vectors are mean-centered across all dimensions
-3. **Power iterate** — the top 3 eigenvectors of the covariance matrix are found iteratively
-4. **Deflate** — each component is subtracted before finding the next (Gram-Schmidt style)
-5. **Project** — every point's position in 3D space = its dot product against the 3 principal components
-6. **Normalize** — coordinates are scaled to fill a ±100 unit cube for comfortable viewing
+1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, runs PCA through PyTorch/CuPy when available (NumPy randomized SVD fallback), and returns normalized 3D coordinates.
+2. **`/api/search` path (filtered subset):** Go performs inline power-iteration PCA for fast small-result reprojection without spawning Python.
+3. **Normalize** — both paths scale coordinates into a ±100 unit cube for comfortable viewing.
 
 The result: semantically similar points cluster together in 3D space. The geometry you see **is** the structure of your knowledge base.
 
@@ -156,9 +155,9 @@ The result: semantically similar points cluster together in 3D space. The geomet
 VectorView exposes a small REST API that the frontend uses — useful for scripting or integration:
 
 ```
-GET  /api/collections          → list all Qdrant collections with metadata
-GET  /api/points?collection=X&limit=N  → PCA-projected points as JSON
-GET  /api/search?collection=X&q=term   → payload keyword search, projected
+GET  /api/collections                     → list all Qdrant collections with metadata
+GET  /api/points?collection=X&limit=N     → full-collection projection via Python PCA worker
+GET  /api/search?collection=X&q=term      → payload keyword search + inline Go PCA reprojection
 ```
 
 Example response from `/api/points`:
@@ -177,7 +176,8 @@ Example response from `/api/points`:
 
 ```
 VectorView/
-├── main.go          # Go server — Qdrant client, PCA, HTTP handlers, embed
+├── main.go          # Go server — Qdrant client, API handlers, inline search PCA, embed
+├── pca_gpu.py       # Python PCA worker for /api/points (PyTorch/CuPy/NumPy fallback)
 ├── static/
 │   └── index.html   # Entire frontend — Three.js, GLSL shaders, HUD
 ├── go.mod
