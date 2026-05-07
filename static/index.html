@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VectorView — meistro_brain</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --obsidian: #050508;
+    --deep:     #080b12;
+    --panel:    #0a0d18cc;
+    --border:   #1a2a4a;
+    --neon-c:   #00f5ff;
+    --neon-m:   #ff00ff;
+    --neon-g:   #39ff14;
+    --neon-o:   #ff6600;
+    --text:     #c8d8f0;
+    --dim:      #4a6080;
+    --font-mono: 'Share Tech Mono', monospace;
+    --font-hud:  'Orbitron', sans-serif;
+  }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: var(--obsidian);
+    color: var(--text);
+    font-family: var(--font-mono);
+    overflow: hidden;
+  }
+
+  #canvas-container {
+    position: fixed; inset: 0;
+    z-index: 0;
+  }
+
+  canvas { display: block; }
+
+  /* ── HUD panels ── */
+  .hud {
+    position: fixed;
+    z-index: 10;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(12px);
+    padding: 14px 18px;
+  }
+
+  /* Top bar */
+  #hud-top {
+    top: 0; left: 0; right: 0;
+    display: flex; align-items: center; gap: 24px;
+    border-top: none; border-left: none; border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding: 10px 20px;
+  }
+
+  #logo {
+    font-family: var(--font-hud);
+    font-size: 1.1rem;
+    font-weight: 900;
+    letter-spacing: 0.15em;
+    color: var(--neon-c);
+    text-shadow: 0 0 20px var(--neon-c), 0 0 40px #00f5ff44;
+    white-space: nowrap;
+  }
+
+  #logo span { color: var(--neon-m); text-shadow: 0 0 20px var(--neon-m); }
+
+  .hud-stat {
+    display: flex; flex-direction: column; gap: 2px;
+    font-size: 0.65rem; color: var(--dim);
+  }
+  .hud-stat strong {
+    font-size: 0.9rem; color: var(--neon-c); font-family: var(--font-hud);
+    font-weight: 400;
+  }
+
+  #collection-select {
+    margin-left: auto;
+    background: #0a1020;
+    border: 1px solid var(--neon-c);
+    color: var(--neon-c);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    padding: 4px 10px;
+    cursor: pointer;
+    outline: none;
+    border-radius: 2px;
+  }
+
+  #btn-reload {
+    background: transparent;
+    border: 1px solid var(--neon-g);
+    color: var(--neon-g);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    padding: 4px 12px;
+    cursor: pointer;
+    letter-spacing: 0.1em;
+    transition: background 0.2s;
+  }
+  #btn-reload:hover { background: #39ff1420; }
+
+  /* Left panel — controls */
+  #hud-left {
+    top: 60px; left: 0;
+    width: 220px;
+    border-left: none;
+    border-radius: 0 4px 4px 0;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+
+  .panel-title {
+    font-family: var(--font-hud);
+    font-size: 0.6rem;
+    letter-spacing: 0.2em;
+    color: var(--dim);
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+    margin-bottom: 4px;
+  }
+
+  .ctrl-row {
+    display: flex; flex-direction: column; gap: 4px;
+    font-size: 0.7rem; color: var(--dim);
+  }
+  .ctrl-row label { display: flex; justify-content: space-between; }
+  .ctrl-row label span { color: var(--neon-c); }
+
+  input[type=range] {
+    width: 100%; accent-color: var(--neon-c);
+    cursor: pointer;
+  }
+
+  .color-legend {
+    display: flex; flex-direction: column; gap: 6px;
+    font-size: 0.68rem;
+  }
+  .legend-item {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .legend-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* Right panel — point inspector */
+  #hud-right {
+    top: 60px; right: 0;
+    width: 280px;
+    border-right: none;
+    border-radius: 4px 0 0 4px;
+    display: flex; flex-direction: column; gap: 10px;
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+  }
+
+  #inspector-empty {
+    color: var(--dim); font-size: 0.72rem; text-align: center;
+    padding: 20px 0;
+  }
+
+  #inspector-content { display: none; }
+  #inspector-content.active { display: block; }
+
+  .insp-field {
+    font-size: 0.68rem;
+    margin-bottom: 8px;
+    line-height: 1.5;
+  }
+  .insp-key { color: var(--dim); text-transform: uppercase; font-size: 0.6rem; letter-spacing: 0.1em; }
+  .insp-val { color: var(--text); word-break: break-word; }
+  .insp-val.highlight { color: var(--neon-g); }
+
+  /* Bottom — search */
+  #hud-bottom {
+    bottom: 0; left: 0; right: 0;
+    display: flex; align-items: center; gap: 12px;
+    border-bottom: none; border-left: none; border-right: none;
+    border-top: 1px solid var(--border);
+    padding: 10px 20px;
+  }
+
+  #search-input {
+    flex: 1;
+    background: #070a14;
+    border: 1px solid var(--border);
+    color: var(--neon-c);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    padding: 6px 12px;
+    outline: none;
+    border-radius: 2px;
+    transition: border-color 0.2s;
+  }
+  #search-input:focus { border-color: var(--neon-c); box-shadow: 0 0 10px #00f5ff22; }
+  #search-input::placeholder { color: var(--dim); }
+
+  #btn-search {
+    background: transparent;
+    border: 1px solid var(--neon-c);
+    color: var(--neon-c);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    padding: 6px 16px;
+    cursor: pointer;
+    letter-spacing: 0.1em;
+    transition: background 0.2s;
+  }
+  #btn-search:hover { background: #00f5ff15; }
+
+  #search-status {
+    font-size: 0.68rem; color: var(--dim); white-space: nowrap;
+  }
+
+  /* Loading overlay */
+  #loading {
+    position: fixed; inset: 0; z-index: 100;
+    background: var(--obsidian);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 20px;
+    transition: opacity 0.6s;
+  }
+  #loading.hidden { opacity: 0; pointer-events: none; }
+
+  #loading-title {
+    font-family: var(--font-hud);
+    font-size: 2rem;
+    font-weight: 900;
+    color: var(--neon-c);
+    text-shadow: 0 0 30px var(--neon-c), 0 0 60px #00f5ff33;
+    letter-spacing: 0.2em;
+  }
+
+  #loading-sub {
+    font-size: 0.75rem;
+    color: var(--dim);
+    letter-spacing: 0.15em;
+  }
+
+  .spinner {
+    width: 48px; height: 48px;
+    border: 2px solid var(--border);
+    border-top-color: var(--neon-c);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Crosshair */
+  #crosshair {
+    position: fixed;
+    width: 20px; height: 20px;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    z-index: 5;
+  }
+  #crosshair::before, #crosshair::after {
+    content: '';
+    position: absolute;
+    background: var(--neon-c);
+    opacity: 0.3;
+  }
+  #crosshair::before { width: 1px; height: 100%; left: 50%; }
+  #crosshair::after  { height: 1px; width: 100%; top: 50%; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div id="loading-title">VECTOR<span style="color:var(--neon-m)">VIEW</span></div>
+  <div class="spinner"></div>
+  <div id="loading-sub">INITIALIZING LATENT SPACE…</div>
+</div>
+
+<div id="canvas-container"></div>
+<div id="crosshair"></div>
+
+<!-- Top HUD -->
+<div class="hud" id="hud-top">
+  <div id="logo">VECTOR<span>VIEW</span></div>
+  <div class="hud-stat"><span>COLLECTION</span><strong id="stat-collection">—</strong></div>
+  <div class="hud-stat"><span>POINTS</span><strong id="stat-points">—</strong></div>
+  <div class="hud-stat"><span>VISIBLE</span><strong id="stat-visible">—</strong></div>
+  <div class="hud-stat"><span>FPS</span><strong id="stat-fps">—</strong></div>
+  <select id="collection-select"></select>
+  <button id="btn-reload">↺ RELOAD</button>
+</div>
+
+<!-- Left HUD -->
+<div class="hud" id="hud-left">
+  <div class="panel-title">⬡ Controls</div>
+
+  <div class="ctrl-row">
+    <label>Point Size <span id="val-size">2.5</span></label>
+    <input type="range" id="ctrl-size" min="0.5" max="8" step="0.5" value="2.5">
+  </div>
+
+  <div class="ctrl-row">
+    <label>Opacity <span id="val-opacity">0.85</span></label>
+    <input type="range" id="ctrl-opacity" min="0.1" max="1" step="0.05" value="0.85">
+  </div>
+
+  <div class="ctrl-row">
+    <label>Bloom Strength <span id="val-bloom">1.2</span></label>
+    <input type="range" id="ctrl-bloom" min="0" max="3" step="0.1" value="1.2">
+  </div>
+
+  <div class="ctrl-row">
+    <label>Rotation Speed <span id="val-speed">0.2</span></label>
+    <input type="range" id="ctrl-speed" min="0" max="2" step="0.05" value="0.2">
+  </div>
+
+  <div class="panel-title">⬡ Legend</div>
+  <div class="color-legend" id="legend"></div>
+
+  <div class="panel-title">⬡ Navigation</div>
+  <div style="font-size:0.65rem; color:var(--dim); line-height:1.8;">
+    <div>🖱 Drag — Orbit</div>
+    <div>🖱 Scroll — Zoom</div>
+    <div>🖱 Right drag — Pan</div>
+    <div>Click point — Inspect</div>
+  </div>
+</div>
+
+<!-- Right HUD — Inspector -->
+<div class="hud" id="hud-right">
+  <div class="panel-title">⬡ Point Inspector</div>
+  <div id="inspector-empty">Hover or click a point<br>to inspect its payload</div>
+  <div id="inspector-content"></div>
+</div>
+
+<!-- Bottom HUD -->
+<div class="hud" id="hud-bottom">
+  <input type="text" id="search-input" placeholder="Search payload text…" />
+  <button id="btn-search">SCAN</button>
+  <span id="search-status"></span>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ── OrbitControls (inline, r128 compatible) ───────────────────────────────────
+class OrbitControls {
+  constructor(camera, domElement) {
+    this.camera = camera;
+    this.domElement = domElement;
+    this.target = new THREE.Vector3();
+    this.enableDamping = true;
+    this.dampingFactor = 0.05;
+    this.rotateSpeed = 0.5;
+    this.zoomSpeed = 1.2;
+    this.panSpeed = 0.8;
+    this.autoRotate = true;
+    this.autoRotateSpeed = 0.2;
+
+    this._spherical = new THREE.Spherical();
+    this._sphericalDelta = new THREE.Spherical();
+    this._scale = 1;
+    this._panOffset = new THREE.Vector3();
+    this._dragging = false;
+    this._button = -1;
+    this._lastPos = { x: 0, y: 0 };
+
+    this._updateSpherical();
+    this._bind();
+  }
+
+  _updateSpherical() {
+    const offset = this.camera.position.clone().sub(this.target);
+    this._spherical.setFromVector3(offset);
+  }
+
+  _bind() {
+    const el = this.domElement;
+    el.addEventListener('mousedown',  e => this._onMouseDown(e));
+    el.addEventListener('mousemove',  e => this._onMouseMove(e));
+    el.addEventListener('mouseup',    () => { this._dragging = false; });
+    el.addEventListener('wheel',      e => this._onWheel(e), { passive: false });
+    el.addEventListener('contextmenu', e => e.preventDefault());
+  }
+
+  _onMouseDown(e) {
+    this._dragging = true;
+    this._button = e.button;
+    this._lastPos = { x: e.clientX, y: e.clientY };
+  }
+
+  _onMouseMove(e) {
+    if (!this._dragging) return;
+    const dx = e.clientX - this._lastPos.x;
+    const dy = e.clientY - this._lastPos.y;
+    this._lastPos = { x: e.clientX, y: e.clientY };
+
+    if (this._button === 0) {
+      this._sphericalDelta.theta -= (2 * Math.PI * dx / this.domElement.clientWidth) * this.rotateSpeed;
+      this._sphericalDelta.phi   -= (2 * Math.PI * dy / this.domElement.clientHeight) * this.rotateSpeed;
+    } else if (this._button === 2) {
+      this._pan(dx, dy);
+    }
+  }
+
+  _pan(dx, dy) {
+    const el = this.domElement;
+    const dist = this.camera.position.distanceTo(this.target);
+    const fovRad = this.camera.fov * Math.PI / 180;
+    const heightAtDist = 2 * dist * Math.tan(fovRad / 2);
+    const px = (this.panSpeed * dx * heightAtDist) / el.clientHeight;
+    const py = (this.panSpeed * dy * heightAtDist) / el.clientHeight;
+    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
+    const up    = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
+    this._panOffset.addScaledVector(right, -px);
+    this._panOffset.addScaledVector(up, py);
+  }
+
+  _onWheel(e) {
+    e.preventDefault();
+    if (e.deltaY > 0) this._scale /= Math.pow(0.95, this.zoomSpeed);
+    else              this._scale *= Math.pow(0.95, this.zoomSpeed);
+  }
+
+  update() {
+    if (this.autoRotate && !this._dragging) {
+      this._sphericalDelta.theta -= (2 * Math.PI / 60 / 60) * this.autoRotateSpeed;
+    }
+
+    this._spherical.theta += this._sphericalDelta.theta;
+    this._spherical.phi   += this._sphericalDelta.phi;
+    this._spherical.phi    = Math.max(0.05, Math.min(Math.PI - 0.05, this._spherical.phi));
+    this._spherical.radius *= this._scale;
+    this._spherical.radius  = Math.max(10, Math.min(2000, this._spherical.radius));
+
+    this.target.add(this._panOffset);
+
+    const offset = new THREE.Vector3().setFromSpherical(this._spherical);
+    this.camera.position.copy(this.target).add(offset);
+    this.camera.lookAt(this.target);
+
+    if (this.enableDamping) {
+      this._sphericalDelta.theta *= (1 - this.dampingFactor);
+      this._sphericalDelta.phi   *= (1 - this.dampingFactor);
+      this._panOffset.multiplyScalar(1 - this.dampingFactor);
+    } else {
+      this._sphericalDelta.set(0, 0, 0);
+      this._panOffset.set(0, 0, 0);
+    }
+    this._scale = 1;
+  }
+
+  setAutoRotateSpeed(s) { this.autoRotateSpeed = s; }
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let scene, camera, renderer, controls;
+let particleSystem = null;
+let glowSystem = null;
+let allPoints = [];
+let currentCollection = 'meistro_brain';
+let animAutoRotate = true;
+let bloomStrength = 1.2;
+let rotSpeed = 0.2;
+let hovered = -1;
+const raycaster = new THREE.Raycaster();
+raycaster.params.Points.threshold = 1.2;
+const mouse = new THREE.Vector2(-9999, -9999);
+
+// Color palette per cluster bucket
+const PALETTE = [
+  0x00f5ff, 0xff00ff, 0x39ff14, 0xff6600,
+  0xffff00, 0x7b2fff, 0xff2d55, 0x00ff88,
+  0xff9500, 0x0099ff,
+];
+
+// ── Init Three.js ─────────────────────────────────────────────────────────────
+function initScene() {
+  const container = document.getElementById('canvas-container');
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x050508);
+  scene.fog = new THREE.FogExp2(0x050508, 0.0008);
+
+  camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 5000);
+  camera.position.set(0, 0, 300);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.toneMapping = THREE.ReinhardToneMapping;
+  renderer.toneMappingExposure = 1.2;
+  container.appendChild(renderer.domElement);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.autoRotateSpeed = rotSpeed;
+
+  // Star field background
+  addStarField();
+
+  // Grid helper — subtle
+  const grid = new THREE.GridHelper(1000, 40, 0x0a1428, 0x0a1428);
+  grid.position.y = -150;
+  scene.add(grid);
+
+  // Ambient light
+  scene.add(new THREE.AmbientLight(0x111133, 2));
+  const pLight = new THREE.PointLight(0x00f5ff, 2, 600);
+  pLight.position.set(0, 100, 0);
+  scene.add(pLight);
+
+  window.addEventListener('resize', onResize);
+  renderer.domElement.addEventListener('mousemove', onMouseMove);
+  renderer.domElement.addEventListener('click', onClick);
+}
+
+function addStarField() {
+  const geo = new THREE.BufferGeometry();
+  const count = 6000;
+  const pos = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    pos[i*3]   = (Math.random() - 0.5) * 4000;
+    pos[i*3+1] = (Math.random() - 0.5) * 4000;
+    pos[i*3+2] = (Math.random() - 0.5) * 4000;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({ size: 0.4, color: 0x334466, sizeAttenuation: true });
+  scene.add(new THREE.Points(geo, mat));
+}
+
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function onMouseMove(e) {
+  mouse.x =  (e.clientX / window.innerWidth)  * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+}
+
+function onClick(e) {
+  if (!particleSystem) return;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObject(particleSystem);
+  if (hits.length > 0) {
+    const idx = hits[0].index;
+    showInspector(allPoints[idx]);
+  }
+}
+
+// ── Build particle cloud ──────────────────────────────────────────────────────
+function buildParticles(points) {
+  if (particleSystem) { scene.remove(particleSystem); particleSystem.geometry.dispose(); particleSystem.material.dispose(); }
+  if (glowSystem)     { scene.remove(glowSystem);     glowSystem.geometry.dispose();     glowSystem.material.dispose(); }
+
+  const n = points.length;
+  const positions = new Float32Array(n * 3);
+  const colors    = new Float32Array(n * 3);
+  const sizes     = new Float32Array(n);
+
+  // Normalise XYZ to fit in ±100
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  let minZ = Infinity, maxZ = -Infinity;
+  for (const p of points) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
+  }
+  const rangeX = maxX - minX || 1;
+  const rangeY = maxY - minY || 1;
+  const rangeZ = maxZ - minZ || 1;
+  const scale = 200;
+
+  // Cluster by entity_type or source_id bucket
+  const clusterMap = new Map();
+  let clusterIdx = 0;
+  for (const p of points) {
+    const key = (p.payload?.entity_type || p.payload?.source_id || 'unknown').toString().slice(0, 20);
+    if (!clusterMap.has(key)) { clusterMap.set(key, clusterIdx++); }
+  }
+
+  const c = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    const p = points[i];
+    positions[i*3]   = ((p.x - minX) / rangeX - 0.5) * scale;
+    positions[i*3+1] = ((p.y - minY) / rangeY - 0.5) * scale;
+    positions[i*3+2] = ((p.z - minZ) / rangeZ - 0.5) * scale;
+
+    const key = (p.payload?.entity_type || p.payload?.source_id || 'unknown').toString().slice(0, 20);
+    const ci  = clusterMap.get(key) % PALETTE.length;
+    c.setHex(PALETTE[ci]);
+    colors[i*3] = c.r; colors[i*3+1] = c.g; colors[i*3+2] = c.b;
+
+    sizes[i] = 2.5;
+  }
+
+  // Main particle geo
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
+  geo.setAttribute('size',     new THREE.BufferAttribute(sizes, 1));
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime:    { value: 0 },
+      uOpacity: { value: 0.85 },
+      uBloom:   { value: 1.2 },
+    },
+    vertexShader: `
+      attribute float size;
+      attribute vec3 color;
+      varying vec3 vColor;
+      varying float vDist;
+      uniform float uTime;
+      void main() {
+        vColor = color;
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vDist = -mv.z;
+        float pulse = 1.0 + 0.08 * sin(uTime * 2.0 + position.x * 0.05);
+        gl_PointSize = size * pulse * (300.0 / vDist);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vColor;
+      varying float vDist;
+      uniform float uOpacity;
+      uniform float uBloom;
+      void main() {
+        vec2 uv = gl_PointCoord - 0.5;
+        float d = length(uv);
+        if (d > 0.5) discard;
+        float core  = smoothstep(0.5, 0.0, d);
+        float glow  = pow(core, 1.5) * uBloom;
+        vec3  col   = vColor * (core + glow);
+        float alpha = core * uOpacity;
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    vertexColors: true,
+  });
+
+  particleSystem = new THREE.Points(geo, mat);
+  scene.add(particleSystem);
+
+  // Glow layer (bigger, dimmer)
+  const glowGeo = geo.clone();
+  const glowMat = new THREE.ShaderMaterial({
+    uniforms: { uTime: { value: 0 }, uOpacity: { value: 0.15 }, uBloom: { value: 0.8 } },
+    vertexShader: mat.vertexShader,
+    fragmentShader: mat.fragmentShader,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    vertexColors: true,
+  });
+  // scale glow sizes
+  const glowSizes = new Float32Array(n);
+  for (let i = 0; i < n; i++) glowSizes[i] = sizes[i] * 3.5;
+  glowGeo.setAttribute('size', new THREE.BufferAttribute(glowSizes, 1));
+  glowSystem = new THREE.Points(glowGeo, glowMat);
+  scene.add(glowSystem);
+
+  // Build legend
+  buildLegend(clusterMap);
+
+  // Stats
+  document.getElementById('stat-points').textContent  = n.toLocaleString();
+  document.getElementById('stat-visible').textContent = n.toLocaleString();
+  document.getElementById('stat-collection').textContent = currentCollection;
+
+  allPoints = points;
+}
+
+function buildLegend(clusterMap) {
+  const el = document.getElementById('legend');
+  el.innerHTML = '';
+  let i = 0;
+  for (const [key, idx] of clusterMap) {
+    if (i++ > 9) { el.innerHTML += `<div style="color:var(--dim);font-size:0.6rem">…${clusterMap.size - 9} more</div>`; break; }
+    const color = '#' + PALETTE[idx % PALETTE.length].toString(16).padStart(6, '0');
+    el.innerHTML += `<div class="legend-item">
+      <div class="legend-dot" style="background:${color};box-shadow:0 0 6px ${color}"></div>
+      <span style="color:var(--text)">${key}</span>
+    </div>`;
+  }
+}
+
+// ── Inspector ─────────────────────────────────────────────────────────────────
+function showInspector(pt) {
+  if (!pt) return;
+  document.getElementById('inspector-empty').style.display = 'none';
+  const el = document.getElementById('inspector-content');
+  el.classList.add('active');
+
+  const payload = pt.payload || {};
+  let html = `<div class="insp-field"><div class="insp-key">ID</div><div class="insp-val highlight">${pt.id}</div></div>`;
+  html += `<div class="insp-field"><div class="insp-key">PCA Coords</div><div class="insp-val">${pt.x.toFixed(3)}, ${pt.y.toFixed(3)}, ${pt.z.toFixed(3)}</div></div>`;
+
+  const priority = ['entity_type', 'source_id', 'title', 'text', 'content', 'chunk_text', 'author', 'timestamp'];
+  const shown = new Set();
+  for (const k of priority) {
+    if (payload[k] !== undefined) {
+      const v = String(payload[k]);
+      html += `<div class="insp-field"><div class="insp-key">${k}</div><div class="insp-val">${v.length > 200 ? v.slice(0, 200) + '…' : v}</div></div>`;
+      shown.add(k);
+    }
+  }
+  for (const [k, v] of Object.entries(payload)) {
+    if (shown.has(k)) continue;
+    const sv = String(v);
+    html += `<div class="insp-field"><div class="insp-key">${k}</div><div class="insp-val">${sv.length > 120 ? sv.slice(0, 120) + '…' : sv}</div></div>`;
+  }
+  el.innerHTML = html;
+}
+
+// ── Raycasting hover ──────────────────────────────────────────────────────────
+let lastHoverIdx = -1;
+function checkHover() {
+  if (!particleSystem || allPoints.length === 0) return;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObject(particleSystem);
+  const idx = hits.length > 0 ? hits[0].index : -1;
+  if (idx !== lastHoverIdx) {
+    lastHoverIdx = idx;
+    if (idx >= 0) {
+      renderer.domElement.style.cursor = 'pointer';
+      showInspector(allPoints[idx]);
+    } else {
+      renderer.domElement.style.cursor = 'default';
+    }
+  }
+}
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+let lastTime = performance.now();
+let frameCount = 0;
+let fps = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const delta = (now - lastTime) / 1000;
+  lastTime = now;
+  frameCount++;
+  if (frameCount % 30 === 0) {
+    fps = Math.round(30 / (delta * 30 + 0.0001));
+    document.getElementById('stat-fps').textContent = fps;
+  }
+
+  controls.setAutoRotateSpeed(rotSpeed);
+  controls.update();
+  checkHover();
+
+  if (particleSystem) {
+    particleSystem.material.uniforms.uTime.value = now * 0.001;
+  }
+  if (glowSystem) {
+    glowSystem.material.uniforms.uTime.value = now * 0.001;
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ── Data loading ──────────────────────────────────────────────────────────────
+async function loadCollections() {
+  try {
+    const res = await fetch('/api/collections');
+    const cols = await res.json();
+    const sel = document.getElementById('collection-select');
+    sel.innerHTML = '';
+    for (const c of cols) {
+      const opt = document.createElement('option');
+      opt.value = c.name;
+      opt.textContent = `${c.name} (${c.points_count?.toLocaleString() ?? '?'} pts)`;
+      if (c.name === 'meistro_brain') opt.selected = true;
+      sel.appendChild(opt);
+    }
+    currentCollection = sel.value;
+  } catch (e) {
+    console.warn('Could not load collections:', e);
+  }
+}
+
+async function loadPoints(collection, limit = 2000) {
+  document.getElementById('loading').classList.remove('hidden');
+  document.getElementById('loading-sub').textContent = `PULLING ${limit} VECTORS FROM ${collection.toUpperCase()}…`;
+  try {
+    const res = await fetch(`/api/points?collection=${encodeURIComponent(collection)}&limit=${limit}`);
+    const data = await res.json();
+    buildParticles(data.points || []);
+  } catch(e) {
+    document.getElementById('loading-sub').textContent = 'ERROR: ' + e.message;
+    return;
+  }
+  setTimeout(() => document.getElementById('loading').classList.add('hidden'), 500);
+}
+
+async function doSearch() {
+  const q = document.getElementById('search-input').value.trim();
+  if (!q) { loadPoints(currentCollection); return; }
+  document.getElementById('search-status').textContent = 'SCANNING…';
+  try {
+    const res = await fetch(`/api/search?collection=${encodeURIComponent(currentCollection)}&q=${encodeURIComponent(q)}&limit=500`);
+    const data = await res.json();
+    buildParticles(data.points || []);
+    document.getElementById('search-status').textContent = `${(data.points||[]).length} HITS`;
+  } catch(e) {
+    document.getElementById('search-status').textContent = 'ERROR';
+  }
+}
+
+// ── Controls wiring ───────────────────────────────────────────────────────────
+function wireControls() {
+  document.getElementById('ctrl-size').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    document.getElementById('val-size').textContent = v;
+    if (particleSystem) {
+      const sizes = particleSystem.geometry.attributes.size.array;
+      sizes.fill(v);
+      particleSystem.geometry.attributes.size.needsUpdate = true;
+      const gs = glowSystem.geometry.attributes.size.array;
+      gs.fill(v * 3.5);
+      glowSystem.geometry.attributes.size.needsUpdate = true;
+    }
+  });
+
+  document.getElementById('ctrl-opacity').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    document.getElementById('val-opacity').textContent = v;
+    if (particleSystem) particleSystem.material.uniforms.uOpacity.value = v;
+  });
+
+  document.getElementById('ctrl-bloom').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    document.getElementById('val-bloom').textContent = v;
+    if (particleSystem) particleSystem.material.uniforms.uBloom.value = v;
+    if (glowSystem)     glowSystem.material.uniforms.uBloom.value = v * 0.6;
+  });
+
+  document.getElementById('ctrl-speed').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    document.getElementById('val-speed').textContent = v;
+    rotSpeed = v;
+  });
+
+  document.getElementById('collection-select').addEventListener('change', e => {
+    currentCollection = e.target.value;
+    loadPoints(currentCollection);
+    document.getElementById('search-status').textContent = '';
+    document.getElementById('search-input').value = '';
+  });
+
+  document.getElementById('btn-reload').addEventListener('click', () => {
+    loadPoints(currentCollection);
+  });
+
+  document.getElementById('btn-search').addEventListener('click', doSearch);
+  document.getElementById('search-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doSearch();
+  });
+}
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+async function main() {
+  initScene();
+  animate();
+  wireControls();
+  await loadCollections();
+  await loadPoints(currentCollection);
+}
+
+main();
+</script>
+</body>
+</html>
