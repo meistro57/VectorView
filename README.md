@@ -19,6 +19,7 @@
 </div>
 
 ---
+<img width="1639" height="1307" alt="image" src="https://github.com/user-attachments/assets/5fba66be-df6c-4143-9346-5cfd9aee272b" />
 
 VectorView is a **Go-first local app** that turns your [Qdrant](https://qdrant.tech) vector collections into a live, interactive **3D particle universe** — rendered in the browser with Three.js and a custom GLSL shader engine. The server is a single Go binary with an optional Python PCA worker for fast large-collection projection. No Node.js build step. No config hell. One command, one port, instant visualization.
 
