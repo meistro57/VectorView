@@ -59,6 +59,9 @@
   }
 
   #logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     font-family: var(--font-hud);
     font-size: 1.1rem;
     font-weight: 900;
@@ -69,6 +72,14 @@
   }
 
   #logo span { color: var(--neon-m); text-shadow: 0 0 20px var(--neon-m); }
+
+  #logo-mark {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    object-fit: cover;
+    box-shadow: 0 0 18px #00f5ff55;
+  }
 
   .hud-stat {
     display: flex; flex-direction: column; gap: 2px;
@@ -246,6 +257,18 @@
     background: #0c152b;
   }
 
+  .similar-item.focused {
+    border-color: var(--neon-c);
+    box-shadow: 0 0 16px #00f5ff44;
+    background: #0f1d38;
+  }
+
+  .similar-item.inspecting {
+    border-color: var(--neon-m);
+    box-shadow: 0 0 20px #ff00ff44;
+    background: #1a1030;
+  }
+
   .similar-item.offscreen {
     cursor: default;
     opacity: 0.7;
@@ -334,6 +357,14 @@
   }
   #loading.hidden { opacity: 0; pointer-events: none; }
 
+  #loading-logo {
+    width: 92px;
+    height: 92px;
+    border-radius: 18px;
+    object-fit: cover;
+    box-shadow: 0 0 40px #00f5ff33;
+  }
+
   #loading-title {
     font-family: var(--font-hud);
     font-size: 2rem;
@@ -386,6 +417,7 @@
 <body>
 
 <div id="loading">
+  <img id="loading-logo" src="/logo.png" alt="VectorView logo">
   <div id="loading-title">VECTOR<span style="color:var(--neon-m)">VIEW</span></div>
   <div class="spinner"></div>
   <div id="loading-sub">INITIALIZING LATENT SPACE…</div>
@@ -396,7 +428,7 @@
 
 <!-- Top HUD -->
 <div class="hud" id="hud-top">
-  <div id="logo">VECTOR<span>VIEW</span></div>
+  <div id="logo"><img id="logo-mark" src="/logo.png" alt="VectorView logo">VECTOR<span>VIEW</span></div>
   <div class="hud-stat"><span>COLLECTION</span><strong id="stat-collection">—</strong></div>
   <div class="hud-stat"><span>POINTS</span><strong id="stat-points">—</strong></div>
   <div class="hud-stat"><span>VISIBLE</span><strong id="stat-visible">—</strong></div>
@@ -636,6 +668,8 @@ let basePointSizes = null;
 let selectedPoint = null;
 let selectedPointID = '';
 let similarityModeActive = false;
+let hoveredSimilarPointID = '';
+let poppedSimilarPointID = '';
 let scanNeighborIDs = new Set();
 let scanResults = [];
 const raycaster = new THREE.Raycaster();
@@ -666,6 +700,23 @@ function pointIDKey(id) {
     return String(id);
   }
   return String(id);
+}
+
+function hasPayloadValue(value) {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.trim() !== '';
+  return true;
+}
+
+function payloadLookup(payload, ...keys) {
+  if (!payload || typeof payload !== 'object') return undefined;
+  for (const key of keys) {
+    for (const variant of [key, key.toLowerCase(), key.toUpperCase()]) {
+      const value = payload[variant];
+      if (hasPayloadValue(value)) return value;
+    }
+  }
+  return undefined;
 }
 
 function refreshPointColors() {
@@ -771,12 +822,13 @@ function onClick(e) {
 
 // ── Build particle cloud ──────────────────────────────────────────────────────
 function extractClusterKey(point) {
-  const source = (point.payload?.file_source ?? '').toString();
+  const sourceValue = payloadLookup(point.payload, 'file_source', 'source_id', 'source_collection', 'source_file', 'source');
+  const source = sourceValue === undefined ? '' : String(sourceValue);
   if (!source) return 'unknown';
   const prefix = source.split('_')[0];
   const match = prefix.match(/^(\d+)/);
   if (match) return match[1];
-  return prefix || 'unknown';
+  return prefix || source || 'unknown';
 }
 
 function buildParticles(points) {
@@ -865,13 +917,21 @@ function buildParticles(points) {
           vScanAlpha = 1.0;
           vScanBoost = 1.55;
           scanSize = 1.35;
-        } else if (scanFlag >= 2.5) {
+        } else if (scanFlag >= 2.5 && scanFlag < 3.5) {
           vScanAlpha = 1.0;
           vScanBoost = 2.0 * strongPulse;
           scanSize = 1.6 * strongPulse;
+        } else if (scanFlag >= 3.5) {
+          vScanAlpha = 1.0;
+          vScanBoost = 2.8 * strongPulse;
+          scanSize = 2.2 * strongPulse;
         }
 
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        if (scanFlag >= 3.5) {
+          vec3 towardCamera = normalize(-mv.xyz);
+          mv.xyz += towardCamera * 18.0;
+        }
         float vDist = -mv.z;
         float pulse = 1.0 + 0.12 * sin(uTime * 1.8 + position.x * 0.07 + position.z * 0.05);
         gl_PointSize = size * scanSize * uSizeMult * pulse * (400.0 / max(vDist, 1.0));
@@ -1061,11 +1121,13 @@ function shortText(value, maxLen) {
 }
 
 function getSignalTitle(payload, fallbackID) {
-  return payload?.title || payload?.source_id || payload?.file_source || `Signal ${fallbackID}`;
+  const title = payloadLookup(payload, 'title', 'source_id', 'file_source', 'source_file');
+  return title !== undefined ? title : `Signal ${fallbackID}`;
 }
 
 function getSignalSnippet(payload) {
-  return payload?.text || payload?.content || payload?.chunk_text || payload?.summary || 'No preview text available.';
+  const snippet = payloadLookup(payload, 'text', 'content', 'chunk_text', 'summary', 'claims', 'questions');
+  return snippet !== undefined ? snippet : 'No preview text available.';
 }
 
 function setScanStatus(message, kind = 'muted') {
@@ -1092,28 +1154,31 @@ function showInspector(pt, mode = 'selected') {
   html += `<div class="insp-field"><div class="insp-key">ID</div><div class="insp-val highlight">${escapeHTML(pt.id)}</div></div>`;
   html += `<div class="insp-field"><div class="insp-key">PCA Coords</div><div class="insp-val">${pt.x.toFixed(3)}, ${pt.y.toFixed(3)}, ${pt.z.toFixed(3)}</div></div>`;
 
-  const priority = ['entity_type', 'source_id', 'title', 'text', 'content', 'chunk_text', 'author', 'timestamp'];
+  const priority = ['entity_type', 'source_id', 'source_collection', 'source_file', 'chunk_index', 'title', 'summary', 'text', 'content', 'chunk_text', 'claims', 'concepts', 'questions', 'tone', 'author', 'timestamp'];
   const shown = new Set();
   for (const k of priority) {
-    if (payload[k] !== undefined) {
-      const v = shortText(payload[k], 200);
-      html += `<div class="insp-field"><div class="insp-key">${escapeHTML(k)}</div><div class="insp-val">${escapeHTML(v)}</div></div>`;
-      shown.add(k);
-    }
+    const value = payloadLookup(payload, k);
+    if (value === undefined) continue;
+    const canonicalKey = k.toLowerCase();
+    if (shown.has(canonicalKey)) continue;
+    const v = shortText(value, 200);
+    html += `<div class="insp-field"><div class="insp-key">${escapeHTML(k)}</div><div class="insp-val">${escapeHTML(v)}</div></div>`;
+    shown.add(canonicalKey);
   }
   for (const [k, v] of Object.entries(payload)) {
-    if (shown.has(k)) continue;
+    if (shown.has(k.toLowerCase())) continue;
     const sv = shortText(v, 120);
     html += `<div class="insp-field"><div class="insp-key">${escapeHTML(k)}</div><div class="insp-val">${escapeHTML(sv)}</div></div>`;
   }
   el.innerHTML = html;
 }
 
-function focusPointByIndex(index) {
+function focusPointByIndex(index, closeInspect = false) {
   if (!particleSystem || !controls || !camera || index < 0) return;
   const pos = particleSystem.geometry.attributes.position.array;
   const target = new THREE.Vector3(pos[index * 3], pos[index * 3 + 1], pos[index * 3 + 2]);
-  const distance = Math.max(60, camera.position.distanceTo(controls.target));
+  const currentDistance = camera.position.distanceTo(controls.target);
+  const distance = closeInspect ? Math.max(28, currentDistance * 0.38) : Math.max(60, currentDistance);
   const direction = camera.position.clone().sub(controls.target).normalize();
   controls.target.copy(target);
   camera.position.copy(target.clone().add(direction.multiplyScalar(distance)));
@@ -1133,7 +1198,7 @@ function applySignalScanHighlight() {
   const scanAttr = particleSystem.geometry.attributes.scanFlag;
   if (!colorAttr || !sizeAttr || !scanAttr) return;
 
-  // Point highlighting mode uses scanFlag: 0=normal, 1=dimmed, 2=similar, 3=selected.
+  // Point highlighting mode uses scanFlag: 0=normal, 1=dimmed, 2=similar, 3=pulse, 4=popout.
   colorAttr.array.set(basePointColors);
   sizeAttr.array.set(basePointSizes);
   scanAttr.array.fill(0);
@@ -1141,7 +1206,9 @@ function applySignalScanHighlight() {
   if (similarityModeActive) {
     for (let i = 0; i < allPoints.length; i++) {
       const id = pointIDKey(allPoints[i].id);
-      if (id === selectedPointID) {
+      if (id === poppedSimilarPointID) {
+        scanAttr.array[i] = 4;
+      } else if (id === hoveredSimilarPointID || id === selectedPointID) {
         scanAttr.array[i] = 3;
       } else if (scanNeighborIDs.has(id)) {
         scanAttr.array[i] = 2;
@@ -1158,6 +1225,8 @@ function applySignalScanHighlight() {
 
 function resetSignalScannerUI() {
   similarityModeActive = false;
+  hoveredSimilarPointID = '';
+  poppedSimilarPointID = '';
   scanNeighborIDs = new Set();
   scanResults = [];
   setScanStatus('');
@@ -1169,6 +1238,8 @@ function resetSignalScannerUI() {
 
 function clearSignalScan() {
   similarityModeActive = false;
+  hoveredSimilarPointID = '';
+  poppedSimilarPointID = '';
   scanNeighborIDs = new Set();
   scanResults = [];
   applySignalScanHighlight();
@@ -1177,14 +1248,30 @@ function clearSignalScan() {
   updateSignalButtons();
 }
 
+function updateSimilarItemState(item, idKey) {
+  item.classList.toggle('focused', idKey !== '' && idKey === hoveredSimilarPointID);
+  item.classList.toggle('inspecting', idKey !== '' && idKey === poppedSimilarPointID);
+}
+
+function syncSimilarItemStates() {
+  const list = document.getElementById('similar-list');
+  for (const child of list.children) {
+    const childID = child.dataset.signalId || '';
+    updateSimilarItemState(child, childID);
+  }
+}
+
 function renderSimilarSignals(results) {
   const list = document.getElementById('similar-list');
   const empty = document.getElementById('similar-empty');
   list.innerHTML = '';
 
   if (!results || results.length === 0) {
+    hoveredSimilarPointID = '';
+    poppedSimilarPointID = '';
     empty.style.display = 'block';
     empty.textContent = similarityModeActive ? 'No neighbors returned.' : 'Select a point and run Find Similar.';
+    applySignalScanHighlight();
     return;
   }
 
@@ -1196,11 +1283,12 @@ function renderSimilarSignals(results) {
     const payload = row.payload || {};
     const title = shortText(getSignalTitle(payload, row.id), 80);
     const snippet = shortText(getSignalSnippet(payload), 120);
-    const source = payload.file_source || payload.source || payload.date || 'unknown source';
+    const source = payloadLookup(payload, 'file_source', 'source_id', 'source_file', 'source', 'date') || 'unknown source';
     const offscreen = idx === undefined;
 
     const item = document.createElement('div');
     item.className = `similar-item${offscreen ? ' offscreen' : ''}`;
+    item.dataset.signalId = idKey;
     item.innerHTML = `
       <div class="similar-rank">${i + 1}. SIGNAL ${escapeHTML(row.id)}</div>
       <div class="similar-title">${escapeHTML(title)}</div>
@@ -1209,19 +1297,39 @@ function renderSimilarSignals(results) {
       ${offscreen ? '<div class="similar-meta">not in current visible sample</div>' : ''}
     `;
     if (!offscreen) {
+      item.addEventListener('mouseenter', () => {
+        hoveredSimilarPointID = idKey;
+        updateSimilarItemState(item, idKey);
+        applySignalScanHighlight();
+      });
+      item.addEventListener('mouseleave', () => {
+        hoveredSimilarPointID = '';
+        updateSimilarItemState(item, idKey);
+        applySignalScanHighlight();
+      });
       item.addEventListener('click', () => {
-        selectPointByIndex(idx);
-        focusPointByIndex(idx);
+        poppedSimilarPointID = idKey;
+        hoveredSimilarPointID = idKey;
+        syncSimilarItemStates();
+        selectPointByIndex(idx, { fromSimilarPane: true });
+        focusPointByIndex(idx, true);
       });
     }
+    updateSimilarItemState(item, idKey);
     list.appendChild(item);
   }
 }
 
-function selectPointByIndex(index) {
+function selectPointByIndex(index, options = {}) {
   if (index < 0 || index >= allPoints.length) return;
+  const fromSimilarPane = options.fromSimilarPane === true;
   selectedPoint = allPoints[index];
   selectedPointID = pointIDKey(selectedPoint.id);
+  if (!fromSimilarPane) {
+    hoveredSimilarPointID = '';
+    poppedSimilarPointID = '';
+    syncSimilarItemStates();
+  }
   showInspector(selectedPoint, 'selected');
   updateSignalButtons();
   if (similarityModeActive) {
@@ -1248,6 +1356,8 @@ async function runFindSimilar() {
     scanResults = Array.isArray(data.neighbors) ? data.neighbors : [];
     scanNeighborIDs = new Set(scanResults.map((n) => pointIDKey(n.id)));
     similarityModeActive = true;
+    hoveredSimilarPointID = '';
+    poppedSimilarPointID = '';
     applySignalScanHighlight();
     renderSimilarSignals(scanResults);
 
@@ -1260,6 +1370,8 @@ async function runFindSimilar() {
     setScanStatus(`${scanResults.length} similar signals · ${visibleHits} highlighted${note}`, 'ok');
   } catch (err) {
     similarityModeActive = false;
+    hoveredSimilarPointID = '';
+    poppedSimilarPointID = '';
     scanNeighborIDs = new Set();
     scanResults = [];
     applySignalScanHighlight();
