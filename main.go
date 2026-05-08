@@ -514,13 +514,17 @@ func main() {
 			WithVectors bool         `json:"with_vectors"`
 		}
 
+		searchableKeys := []string{
+			"text", "content", "chunk_text", "title", "summary", "claims", "concepts", "questions", "source_id", "file_source", "source_file", "tone",
+			"TEXT", "CONTENT", "CHUNK_TEXT", "TITLE", "SUMMARY", "CLAIMS", "CONCEPTS", "QUESTIONS", "SOURCE_ID", "FILE_SOURCE", "SOURCE_FILE", "TONE",
+		}
+		matches := make([]filterMatch, 0, len(searchableKeys))
+		for _, key := range searchableKeys {
+			matches = append(matches, filterMatch{Key: key, Match: matchValue{Text: queryStr}})
+		}
+
 		sreq := searchReq{
-			Filter: filterClause{Should: []filterMatch{
-				{Key: "text", Match: matchValue{Text: queryStr}},
-				{Key: "content", Match: matchValue{Text: queryStr}},
-				{Key: "chunk_text", Match: matchValue{Text: queryStr}},
-				{Key: "title", Match: matchValue{Text: queryStr}},
-			}},
+			Filter:      filterClause{Should: matches},
 			Limit:       limit,
 			WithPayload: true,
 			WithVectors: true,

@@ -42,7 +42,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 
 **Exploration**
 - Orbit, zoom, and pan with mouse — smooth damped controls
-- View cube overlay in the 3D window mirrors camera orientation and supports one-click axis snapping
+- View cube overlay in the 3D window mirrors camera orientation, supports one-click axis snapping, and adds clickable corner markers for instant isometric views
 - Click any particle to inspect its full Qdrant payload in the HUD
 - Signal Scanner: run **Find Similar** on the selected point to fetch nearest neighbors from Qdrant
 - Similarity highlight mode: selected signal pulses, neighbor signals brighten, unrelated points fade
@@ -140,6 +140,7 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | Right drag | Pan |
 | Scroll wheel | Zoom |
 | View cube face click | Snap camera to ±X / ±Y / ±Z |
+| View cube corner click | Snap camera to diagonal isometric view (±X ±Y ±Z) |
 | Click particle | Pin signal in inspector |
 | FIND SIMILAR | Run nearest-neighbor scan in current collection |
 | CLEAR SCAN | Exit highlight mode and restore normal cloud |

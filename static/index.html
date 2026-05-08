@@ -673,6 +673,7 @@ let viewCubeCamera = null;
 let viewCubeRenderer = null;
 let viewCubeGroup = null;
 let viewCubePickMesh = null;
+let viewCubeCornerPickMeshes = [];
 let particleSystem = null;
 let hazeSystem = null;
 let glowSystem = null;
@@ -808,6 +809,16 @@ function resizeViewCubeRenderer() {
   viewCubeCamera.updateProjectionMatrix();
 }
 
+function createViewCubeCornerMarker(xSign, ySign, zSign) {
+  const marker = new THREE.Mesh(
+    new THREE.SphereGeometry(0.105, 16, 16),
+    new THREE.MeshBasicMaterial({ color: 0xe7f2ff, transparent: true, opacity: 0.9 })
+  );
+  marker.position.set(0.72 * xSign, 0.72 * ySign, 0.72 * zSign);
+  marker.userData.isoDirection = new THREE.Vector3(xSign, ySign, zSign).normalize();
+  return marker;
+}
+
 function snapCameraToDirection(direction) {
   if (!camera || !controls) return;
   const distance = Math.max(camera.position.distanceTo(controls.target), 60);
@@ -827,10 +838,20 @@ function onViewCubeClick(event) {
   viewCubeMouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   viewCubeRaycaster.setFromCamera(viewCubeMouse, viewCubeCamera);
 
-  const hits = viewCubeRaycaster.intersectObject(viewCubePickMesh, false);
+  const pickTargets = [...viewCubeCornerPickMeshes, viewCubePickMesh].filter(Boolean);
+  const hits = viewCubeRaycaster.intersectObjects(pickTargets, false);
   if (hits.length === 0) return;
 
-  const materialIndex = hits[0].face ? hits[0].face.materialIndex : -1;
+  const isoHit = hits.find((hit) => hit.object?.userData?.isoDirection instanceof THREE.Vector3);
+  if (isoHit) {
+    snapCameraToDirection(isoHit.object.userData.isoDirection);
+    return;
+  }
+
+  const cubeHit = hits.find((hit) => hit.object === viewCubePickMesh);
+  if (!cubeHit) return;
+
+  const materialIndex = cubeHit.face ? cubeHit.face.materialIndex : -1;
   const directions = [
     new THREE.Vector3(1, 0, 0),
     new THREE.Vector3(-1, 0, 0),
@@ -858,10 +879,10 @@ function initViewCube() {
   const materials = [
     createViewCubeFaceMaterial('+X', '#1d6eff'),
     createViewCubeFaceMaterial('-X', '#1f3868'),
-    createViewCubeFaceMaterial('+Y', '#34d26d'),
-    createViewCubeFaceMaterial('-Y', '#205d38'),
     createViewCubeFaceMaterial('+Z', '#ff4db5'),
     createViewCubeFaceMaterial('-Z', '#6d2f58'),
+    createViewCubeFaceMaterial('+Y', '#34d26d'),
+    createViewCubeFaceMaterial('-Y', '#205d38'),
   ];
 
   const cube = new THREE.Mesh(new THREE.BoxGeometry(1.2, 1.2, 1.2), materials);
@@ -875,6 +896,23 @@ function initViewCube() {
   viewCubeGroup.add(edges);
   viewCubeScene.add(viewCubeGroup);
   viewCubePickMesh = cube;
+  viewCubeCornerPickMeshes = [];
+
+  const cornerSigns = [
+    [1, 1, 1],
+    [1, 1, -1],
+    [1, -1, 1],
+    [1, -1, -1],
+    [-1, 1, 1],
+    [-1, 1, -1],
+    [-1, -1, 1],
+    [-1, -1, -1],
+  ];
+  for (const [xSign, ySign, zSign] of cornerSigns) {
+    const marker = createViewCubeCornerMarker(xSign, ySign, zSign);
+    viewCubeGroup.add(marker);
+    viewCubeCornerPickMeshes.push(marker);
+  }
 
   viewCubeScene.add(new THREE.AmbientLight(0xffffff, 0.85));
   const light = new THREE.DirectionalLight(0xffffff, 0.65);
