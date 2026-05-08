@@ -138,9 +138,11 @@ type PointData struct {
 }
 
 type CollectionMeta struct {
-	Name        string `json:"name"`
-	PointsCount uint64 `json:"points_count"`
-	VectorSize  uint64 `json:"vector_size"`
+	Name            string `json:"name"`
+	PointsCount     uint64 `json:"points_count"`
+	VectorSize      uint64 `json:"vector_size"`
+	ProjectionReady bool   `json:"projection_ready"`
+	ProjectionNote  string `json:"projection_note,omitempty"`
 }
 
 // ── Qdrant client ─────────────────────────────────────────────────────────────
@@ -209,6 +211,29 @@ func (q *qdrantClient) collectionMeta(ctx context.Context, name string) (Collect
 		PointsCount: info.Result.PointsCount,
 		VectorSize:  info.Result.Config.Params.Vectors.Size,
 	}, nil
+}
+
+func (q *qdrantClient) collectionProjectionStatus(ctx context.Context, name string) (bool, string) {
+	req := scrollRequest{Limit: 64, WithPayload: false, WithVectors: true}
+	raw, status, err := q.do(ctx, http.MethodPost, "/collections/"+name+"/points/scroll", req)
+	if err != nil {
+		return false, err.Error()
+	}
+	if status >= 400 {
+		return false, fmt.Sprintf("qdrant %d", status)
+	}
+
+	var res scrollResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return false, fmt.Sprintf("decode: %v", err)
+	}
+	if res.Result == nil || len(res.Result.Points) == 0 {
+		return true, "empty collection"
+	}
+	if chooseProjectionDimension(res.Result.Points) == 0 {
+		return false, "no dense vectors"
+	}
+	return true, "ok"
 }
 
 func (q *qdrantClient) getPointByID(ctx context.Context, collection, pointID string) (*QPoint, error) {
@@ -411,12 +436,21 @@ func main() {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		metas := make([]CollectionMeta, 0)
+		metas := make([]CollectionMeta, 0, len(names))
 		for _, name := range names {
-			m, err := q.collectionMeta(r.Context(), name)
-			if err == nil {
-				metas = append(metas, m)
+			meta := CollectionMeta{Name: name}
+			if m, err := q.collectionMeta(r.Context(), name); err == nil {
+				meta = m
+			} else {
+				meta.ProjectionReady = false
+				meta.ProjectionNote = "metadata unavailable"
 			}
+			ready, note := q.collectionProjectionStatus(r.Context(), name)
+			meta.ProjectionReady = ready
+			if note != "" {
+				meta.ProjectionNote = note
+			}
+			metas = append(metas, meta)
 		}
 		json.NewEncoder(w).Encode(metas)
 	})
@@ -636,27 +670,93 @@ func toFloatSlice(v interface{}) []float64 {
 	}
 }
 
-func extractDenseVector(v interface{}) []float64 {
+func vectorCandidates(v interface{}) [][]float64 {
 	if vec := toFloatSlice(v); len(vec) > 0 {
-		return vec
+		return [][]float64{vec}
 	}
 	obj, ok := v.(map[string]interface{})
 	if !ok {
 		return nil
 	}
-	for _, raw := range obj {
+
+	keys := make([]string, 0, len(obj))
+	for key := range obj {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	candidates := make([][]float64, 0, len(obj))
+	appendCandidate := func(raw interface{}) {
 		if vec := toFloatSlice(raw); len(vec) > 0 {
-			return vec
+			candidates = append(candidates, vec)
+			return
 		}
 		nested, ok := raw.(map[string]interface{})
 		if !ok {
-			continue
+			return
 		}
 		if vec := toFloatSlice(nested["vector"]); len(vec) > 0 {
+			candidates = append(candidates, vec)
+		}
+	}
+
+	if raw, ok := obj["vector"]; ok {
+		appendCandidate(raw)
+	}
+	for _, key := range keys {
+		if key == "vector" {
+			continue
+		}
+		appendCandidate(obj[key])
+	}
+	return candidates
+}
+
+func extractDenseVector(v interface{}) []float64 {
+	candidates := vectorCandidates(v)
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[0]
+}
+
+func extractDenseVectorByDim(v interface{}, dim int) []float64 {
+	if dim <= 0 {
+		return nil
+	}
+	for _, vec := range vectorCandidates(v) {
+		if len(vec) == dim {
 			return vec
 		}
 	}
 	return nil
+}
+
+func chooseProjectionDimension(points []QPoint) int {
+	dimCounts := make(map[int]int)
+	for _, p := range points {
+		seen := make(map[int]struct{})
+		for _, vec := range vectorCandidates(p.Vector) {
+			dim := len(vec)
+			if dim == 0 {
+				continue
+			}
+			if _, exists := seen[dim]; exists {
+				continue
+			}
+			seen[dim] = struct{}{}
+			dimCounts[dim]++
+		}
+	}
+
+	bestDim, bestCount := 0, 0
+	for dim, count := range dimCounts {
+		if count > bestCount || (count == bestCount && dim > bestDim) {
+			bestDim = dim
+			bestCount = count
+		}
+	}
+	return bestDim
 }
 
 func goPCA3D(points []QPoint) []PointData {
@@ -665,9 +765,14 @@ func goPCA3D(points []QPoint) []PointData {
 		vector []float64
 	}
 
+	selectedDim := chooseProjectionDimension(points)
+	if selectedDim == 0 {
+		return nil
+	}
+
 	valid := make([]projectedPoint, 0, len(points))
 	for _, p := range points {
-		vec := extractDenseVector(p.Vector)
+		vec := extractDenseVectorByDim(p.Vector, selectedDim)
 		if len(vec) == 0 {
 			continue
 		}
@@ -678,7 +783,7 @@ func goPCA3D(points []QPoint) []PointData {
 	if n == 0 {
 		return nil
 	}
-	dim := len(valid[0].vector)
+	dim := selectedDim
 
 	mean := make([]float64, dim)
 	for _, p := range valid {

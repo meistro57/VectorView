@@ -112,17 +112,50 @@ def pca_gpu(matrix):
     return coords
 
 
-def extract_dense_vector(raw_vector):
+def vector_candidates(raw_vector):
     if isinstance(raw_vector, list):
-        return raw_vector
-    if isinstance(raw_vector, dict):
-        for value in raw_vector.values():
-            if isinstance(value, list):
-                return value
-            if isinstance(value, dict):
-                nested = value.get("vector")
-                if isinstance(nested, list):
-                    return nested
+        return [raw_vector]
+    if not isinstance(raw_vector, dict):
+        return []
+
+    keys = sorted(raw_vector.keys())
+    ordered_keys = []
+    if "vector" in raw_vector:
+        ordered_keys.append("vector")
+    ordered_keys.extend([k for k in keys if k != "vector"])
+
+    candidates = []
+    for key in ordered_keys:
+        value = raw_vector.get(key)
+        if isinstance(value, list):
+            candidates.append(value)
+            continue
+        if isinstance(value, dict):
+            nested = value.get("vector")
+            if isinstance(nested, list):
+                candidates.append(nested)
+    return candidates
+
+
+def choose_projection_dim(points):
+    dim_counts = {}
+    for p in points:
+        seen_dims = set()
+        for vec in vector_candidates(p.get("vector")):
+            dim = len(vec)
+            if dim <= 0 or dim in seen_dims:
+                continue
+            seen_dims.add(dim)
+            dim_counts[dim] = dim_counts.get(dim, 0) + 1
+    if not dim_counts:
+        return 0
+    return max(dim_counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def extract_dense_vector(raw_vector, target_dim=None):
+    for vec in vector_candidates(raw_vector):
+        if target_dim is None or len(vec) == target_dim:
+            return vec
     return None
 
 
@@ -144,10 +177,16 @@ def main():
         print(json.dumps({"points": [], "total": 0}))
         return
 
+    target_dim = choose_projection_dim(raw_points)
+    if target_dim <= 0:
+        log("Skipped all points: no dense vectors found")
+        print(json.dumps({"points": [], "total": 0}))
+        return
+
     valid = []
     skipped = 0
     for p in raw_points:
-        vec = extract_dense_vector(p.get("vector"))
+        vec = extract_dense_vector(p.get("vector"), target_dim)
         if not vec:
             skipped += 1
             continue
@@ -157,18 +196,26 @@ def main():
             skipped += 1
 
     if skipped:
-        log(f"Skipped {skipped} points with non-dense or invalid vectors")
+        log(f"Skipped {skipped} points with non-dense or incompatible vectors")
     if not valid:
         print(json.dumps({"points": [], "total": 0}))
         return
 
     points, vectors = zip(*valid)
     matrix = np.vstack(vectors)
-    log(f"Matrix shape: {matrix.shape}")
+    log(f"Matrix shape: {matrix.shape} (dim={target_dim})")
 
     t1 = time.time()
     coords = pca_gpu(matrix)
     log(f"PCA done in {time.time()-t1:.1f}s")
+
+    coords = np.asarray(coords, dtype=np.float32)
+    if coords.ndim == 1:
+        coords = coords.reshape(-1, 1)
+    if coords.shape[1] < 3:
+        coords = np.pad(coords, ((0, 0), (0, 3 - coords.shape[1])), mode="constant")
+    elif coords.shape[1] > 3:
+        coords = coords[:, :3]
 
     # Normalize to [-100, 100] cube
     for axis in range(3):

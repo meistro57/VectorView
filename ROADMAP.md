@@ -30,9 +30,10 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [x] **`.env.example`** — committed template with all vars documented
 - [ ] **Error overlay in UI** — friendly message when Qdrant is unreachable
 - [ ] **Loading progress bar** — show % of points loaded during scroll
-- [ ] **Empty collection handling** — graceful state instead of blank canvas
+- [x] **Empty collection handling** — picker now shows a graceful "No collections available" state
 - [ ] **Responsive layout** — HUD panels collapse on narrow viewports
 - [ ] **Collection metadata sidebar** — vector size, distance metric, point count
+- [x] **Projection readiness in collection picker** — show vector dims and disable unsupported collections
 - [x] **Color grading controls** — hue/saturation/lightness live remap for cluster palette
 - [x] **Point sample slider** — interactive point-count control wired to reload
 - [ ] **Keyboard shortcuts** — `R` reload, `Space` pause rotation, `Esc` clear inspector

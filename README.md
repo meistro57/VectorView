@@ -36,7 +36,8 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 **Visualization**
 - Live 3D particle cloud rendered via custom WebGL shaders — additive blending, pulsing glow, dual-layer bloom
 - Hybrid PCA pipeline: `/api/points` uses `pca_gpu.py` (PyTorch/CuPy/NumPy), `/api/search` uses inline Go PCA for smaller result sets
-- Color-coded clusters by `entity_type`, `source_id`, or any payload field
+- Projection auto-selects the dominant dense vector dimension and skips incompatible vectors
+- Color-coded clusters derived from `payload.file_source` prefix for stable source grouping
 - Exponential fog, starfield background, and a subtle grid anchor the scene in deep space
 
 **Exploration**
@@ -50,7 +51,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 
 **Controls**
 - Real-time sliders: point count, point size, opacity, bloom strength, auto-rotation speed, hue shift, saturation, lightness
-- Collection picker — switch between all Qdrant collections without restarting
+- Collection picker — shows point count/vector dim, disables non-projectable collections, and switches without restarting
 - Reload button — re-pull latest vectors on demand
 
 **Architecture**
@@ -152,8 +153,8 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 
 VectorView uses a **hybrid PCA pipeline**:
 
-1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, extracts usable dense vectors (including simple named-vector shapes), runs PCA through PyTorch/CuPy when available (NumPy randomized SVD fallback), and returns normalized 3D coordinates.
-2. **`/api/search` path (filtered subset):** Go performs inline power-iteration PCA for fast small-result reprojection without spawning Python, using the same dense-vector extraction fallback.
+1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, detects the most common dense vector dimension in the sample, keeps vectors matching that dimension, runs PCA through PyTorch/CuPy when available (NumPy randomized SVD fallback), and returns normalized 3D coordinates.
+2. **`/api/search` path (filtered subset):** Go performs inline power-iteration PCA for fast small-result reprojection without spawning Python, using the same dominant-dimension dense-vector selection logic.
 3. **Normalize** — both paths scale coordinates into a ±100 unit cube for comfortable viewing.
 
 The result: semantically similar points cluster together in 3D space. The geometry you see **is** the structure of your knowledge base.
@@ -186,11 +187,24 @@ Signal Scanner turns the inspector into a neighborhood probe:
 VectorView exposes a small REST API that the frontend uses — useful for scripting or integration:
 
 ```
-GET  /api/collections                                                → list all Qdrant collections with metadata
+GET  /api/collections                                                → list all Qdrant collections with metadata + projection readiness
 GET  /api/points?collection=X&limit=N                                → full-collection projection via Python PCA worker
 GET  /api/search?collection=X&q=term                                 → payload keyword search + inline Go PCA reprojection
 GET  /api/collections/{collection}/points/{point_id}/similar?limit=N → nearest-neighbor scan from selected point vector
 POST /api/collections/{collection}/points/{point_id}/similar         → same as above (JSON body supports {"limit": N})
+```
+
+Example response from `/api/collections`:
+```json
+[
+  {
+    "name": "meistro_brain",
+    "points_count": 847,
+    "vector_size": 768,
+    "projection_ready": true,
+    "projection_note": "ok"
+  }
+]
 ```
 
 Example response from `/api/points`:

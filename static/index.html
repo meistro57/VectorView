@@ -1332,22 +1332,46 @@ async function loadCollections() {
     const res = await fetch('/api/collections');
     const cols = await res.json();
     const sel = document.getElementById('collection-select');
+    const list = Array.isArray(cols) ? cols : [];
     sel.innerHTML = '';
+
+    if (list.length === 0) {
+      const empty = document.createElement('option');
+      empty.value = '';
+      empty.textContent = 'No collections available';
+      empty.disabled = true;
+      empty.selected = true;
+      sel.appendChild(empty);
+      return;
+    }
+
     let selectedName = '';
-    for (const c of cols) {
+    let firstReadyName = '';
+    for (const c of list) {
+      const ready = c.projection_ready !== false;
+      if (ready && !firstReadyName) firstReadyName = c.name;
+
       const opt = document.createElement('option');
       opt.value = c.name;
-      opt.textContent = `${c.name} (${c.points_count?.toLocaleString() ?? '?'} pts)`;
-      if (c.name === currentCollection) {
+      opt.disabled = !ready;
+
+      const pointLabel = c.points_count?.toLocaleString() ?? '?';
+      const dimLabel = c.vector_size ? ` · dim ${c.vector_size}` : '';
+      const stateLabel = ready ? '' : ` · ${c.projection_note || 'unsupported'}`;
+      opt.textContent = `${c.name} (${pointLabel} pts${dimLabel}${stateLabel})`;
+
+      if (c.name === currentCollection && ready) {
         opt.selected = true;
         selectedName = c.name;
       }
       sel.appendChild(opt);
     }
-    if (!selectedName && cols.length > 0) {
-      selectedName = cols[0].name;
+
+    if (!selectedName) {
+      selectedName = firstReadyName || list[0].name;
       sel.value = selectedName;
     }
+
     currentCollection = selectedName || currentCollection;
   } catch (e) {
     console.warn('Could not load collections:', e);
