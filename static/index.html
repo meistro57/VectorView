@@ -408,6 +408,27 @@
   #crosshair::before { width: 1px; height: 100%; left: 50%; }
   #crosshair::after  { height: 1px; width: 100%; top: 50%; }
 
+  #viewcube {
+    position: fixed;
+    top: 78px;
+    right: 296px;
+    width: 112px;
+    height: 112px;
+    z-index: 12;
+    border: 1px solid var(--border);
+    background: #080d17d9;
+    box-shadow: 0 0 20px #00f5ff22;
+    border-radius: 4px;
+    backdrop-filter: blur(4px);
+  }
+
+  #viewcube canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: pointer;
+  }
+
   /* Scrollbar */
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -425,6 +446,7 @@
 
 <div id="canvas-container"></div>
 <div id="crosshair"></div>
+<div id="viewcube"></div>
 
 <!-- Top HUD -->
 <div class="hud" id="hud-top">
@@ -495,6 +517,7 @@
     <div>🖱 Scroll — Zoom</div>
     <div>🖱 Right drag — Pan</div>
     <div>Click point — Inspect</div>
+    <div>Cube click — Snap axis</div>
   </div>
 </div>
 
@@ -645,6 +668,11 @@ class OrbitControls {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let scene, camera, renderer, controls;
+let viewCubeScene = null;
+let viewCubeCamera = null;
+let viewCubeRenderer = null;
+let viewCubeGroup = null;
+let viewCubePickMesh = null;
 let particleSystem = null;
 let hazeSystem = null;
 let glowSystem = null;
@@ -675,6 +703,8 @@ let scanResults = [];
 const raycaster = new THREE.Raycaster();
 raycaster.params.Points.threshold = 3.0;
 const mouse = new THREE.Vector2(-9999, -9999);
+const viewCubeRaycaster = new THREE.Raycaster();
+const viewCubeMouse = new THREE.Vector2();
 
 // Color palette per cluster bucket
 const PALETTE = [
@@ -745,6 +775,125 @@ function refreshPointColors() {
   if (activeClusterMap) buildLegend(activeClusterMap);
 }
 
+function createViewCubeFaceMaterial(label, fillColor) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = fillColor;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = '#0b1224';
+  ctx.lineWidth = 10;
+  ctx.strokeRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#f3f8ff';
+  ctx.font = '700 42px "Orbitron", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, canvas.width / 2, canvas.height / 2);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  return new THREE.MeshBasicMaterial({ map: texture, transparent: true, opacity: 0.96 });
+}
+
+function resizeViewCubeRenderer() {
+  if (!viewCubeRenderer || !viewCubeCamera) return;
+  const host = document.getElementById('viewcube');
+  if (!host) return;
+  const rect = host.getBoundingClientRect();
+  const size = Math.max(1, Math.floor(Math.min(rect.width, rect.height)));
+  viewCubeRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  viewCubeRenderer.setSize(size, size, false);
+  viewCubeCamera.aspect = 1;
+  viewCubeCamera.updateProjectionMatrix();
+}
+
+function snapCameraToDirection(direction) {
+  if (!camera || !controls) return;
+  const distance = Math.max(camera.position.distanceTo(controls.target), 60);
+  const nextPosition = controls.target.clone().add(direction.clone().multiplyScalar(distance));
+  camera.position.copy(nextPosition);
+  camera.up.set(0, 1, 0);
+  camera.lookAt(controls.target);
+  if (typeof controls._updateSpherical === 'function') controls._updateSpherical();
+}
+
+function onViewCubeClick(event) {
+  if (!viewCubePickMesh || !viewCubeCamera) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+
+  viewCubeMouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  viewCubeMouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  viewCubeRaycaster.setFromCamera(viewCubeMouse, viewCubeCamera);
+
+  const hits = viewCubeRaycaster.intersectObject(viewCubePickMesh, false);
+  if (hits.length === 0) return;
+
+  const materialIndex = hits[0].face ? hits[0].face.materialIndex : -1;
+  const directions = [
+    new THREE.Vector3(1, 0, 0),
+    new THREE.Vector3(-1, 0, 0),
+    new THREE.Vector3(0, 1, 0),
+    new THREE.Vector3(0, -1, 0),
+    new THREE.Vector3(0, 0, 1),
+    new THREE.Vector3(0, 0, -1),
+  ];
+
+  const direction = directions[materialIndex];
+  if (direction) {
+    snapCameraToDirection(direction);
+  }
+}
+
+function initViewCube() {
+  const host = document.getElementById('viewcube');
+  if (!host) return;
+
+  viewCubeScene = new THREE.Scene();
+  viewCubeCamera = new THREE.PerspectiveCamera(35, 1, 0.1, 10);
+  viewCubeCamera.position.set(0, 0, 3);
+  viewCubeCamera.lookAt(0, 0, 0);
+
+  const materials = [
+    createViewCubeFaceMaterial('+X', '#1d6eff'),
+    createViewCubeFaceMaterial('-X', '#1f3868'),
+    createViewCubeFaceMaterial('+Y', '#34d26d'),
+    createViewCubeFaceMaterial('-Y', '#205d38'),
+    createViewCubeFaceMaterial('+Z', '#ff4db5'),
+    createViewCubeFaceMaterial('-Z', '#6d2f58'),
+  ];
+
+  const cube = new THREE.Mesh(new THREE.BoxGeometry(1.2, 1.2, 1.2), materials);
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(cube.geometry),
+    new THREE.LineBasicMaterial({ color: 0xc8d8f0, transparent: true, opacity: 0.5 })
+  );
+
+  viewCubeGroup = new THREE.Group();
+  viewCubeGroup.add(cube);
+  viewCubeGroup.add(edges);
+  viewCubeScene.add(viewCubeGroup);
+  viewCubePickMesh = cube;
+
+  viewCubeScene.add(new THREE.AmbientLight(0xffffff, 0.85));
+  const light = new THREE.DirectionalLight(0xffffff, 0.65);
+  light.position.set(2, 2, 3);
+  viewCubeScene.add(light);
+
+  viewCubeRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  viewCubeRenderer.setClearColor(0x000000, 0);
+  host.appendChild(viewCubeRenderer.domElement);
+  viewCubeRenderer.domElement.addEventListener('click', onViewCubeClick);
+  resizeViewCubeRenderer();
+}
+
+function renderViewCube() {
+  if (!viewCubeRenderer || !viewCubeScene || !viewCubeCamera || !viewCubeGroup || !camera) return;
+  viewCubeGroup.quaternion.copy(camera.quaternion).invert();
+  viewCubeRenderer.render(viewCubeScene, viewCubeCamera);
+}
+
 // ── Init Three.js ─────────────────────────────────────────────────────────────
 function initScene() {
   const container = document.getElementById('canvas-container');
@@ -765,6 +914,8 @@ function initScene() {
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.autoRotateSpeed = rotSpeed;
+
+  initViewCube();
 
   // Star field background
   addStarField();
@@ -803,6 +954,7 @@ function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  resizeViewCubeRenderer();
 }
 
 function onMouseMove(e) {
@@ -1436,6 +1588,7 @@ function animate() {
   }
 
   renderer.render(scene, camera);
+  renderViewCube();
 }
 
 // ── Data loading ──────────────────────────────────────────────────────────────

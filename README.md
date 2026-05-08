@@ -37,17 +37,19 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Live 3D particle cloud rendered via custom WebGL shaders — additive blending, pulsing glow, dual-layer bloom
 - Hybrid PCA pipeline: `/api/points` uses `pca_gpu.py` (PyTorch/CuPy/NumPy), `/api/search` uses inline Go PCA for smaller result sets
 - Projection auto-selects the dominant dense vector dimension and skips incompatible vectors
-- Color-coded clusters derived from `payload.file_source` prefix for stable source grouping
+- Color-coded clusters derived from source payload keys (`file_source`, `source_id`, `source_collection`, `source_file`, `source`) with lowercase/UPPERCASE compatibility
 - Exponential fog, starfield background, and a subtle grid anchor the scene in deep space
 
 **Exploration**
 - Orbit, zoom, and pan with mouse — smooth damped controls
+- View cube overlay in the 3D window mirrors camera orientation and supports one-click axis snapping
 - Click any particle to inspect its full Qdrant payload in the HUD
 - Signal Scanner: run **Find Similar** on the selected point to fetch nearest neighbors from Qdrant
 - Similarity highlight mode: selected signal pulses, neighbor signals brighten, unrelated points fade
 - Similar Signals side list with rank, score, snippet, and click-to-focus for loaded points
 - Hover preview — inspector updates as you sweep when no point is pinned
 - Payload text search — keyword scan returns a filtered sub-cloud, re-projected live
+- Payload compatibility layer in UI: title/snippet/source/inspector fields resolve mixed-case keys (for example `source_id` and `SOURCE_ID`)
 
 **Controls**
 - Real-time sliders: point count, point size, opacity, bloom strength, auto-rotation speed, hue shift, saturation, lightness
@@ -137,6 +139,7 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | Left drag | Orbit |
 | Right drag | Pan |
 | Scroll wheel | Zoom |
+| View cube face click | Snap camera to ±X / ±Y / ±Z |
 | Click particle | Pin signal in inspector |
 | FIND SIMILAR | Run nearest-neighbor scan in current collection |
 | CLEAR SCAN | Exit highlight mode and restore normal cloud |
@@ -189,7 +192,7 @@ VectorView exposes a small REST API that the frontend uses — useful for script
 ```
 GET  /api/collections                                                → list all Qdrant collections with metadata + projection readiness
 GET  /api/points?collection=X&limit=N                                → full-collection projection via Python PCA worker
-GET  /api/search?collection=X&q=term                                 → payload keyword search + inline Go PCA reprojection
+GET  /api/search?collection=X&q=term                                 → payload keyword search + inline Go PCA reprojection (mixed-case payload key support)
 GET  /api/collections/{collection}/points/{point_id}/similar?limit=N → nearest-neighbor scan from selected point vector
 POST /api/collections/{collection}/points/{point_id}/similar         → same as above (JSON body supports {"limit": N})
 ```
@@ -206,6 +209,12 @@ Example response from `/api/collections`:
   }
 ]
 ```
+
+`/api/search` currently scans these payload fields (both lowercase and UPPERCASE variants):
+
+- `text`, `content`, `chunk_text`, `title`, `summary`
+- `claims`, `concepts`, `questions`
+- `source_id`, `file_source`, `source_file`, `tone`
 
 Example response from `/api/points`:
 ```json
