@@ -8,6 +8,7 @@
   ╚████╔╝ ███████╗╚██████╗   ██║   ╚██████╔╝██║  ██║     ╚████╔╝ ██║███████╗╚███╔███╔╝
    ╚═══╝  ╚══════╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝      ╚═══╝  ╚═╝╚══════╝ ╚══╝╚══╝
 ```
+<img width="420" height="465" alt="image" src="https://github.com/user-attachments/assets/c4be347a-75ca-447b-a112-f3aa664b3a53" />
 
 **Navigate the latent space. See what you know.**
 
