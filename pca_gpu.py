@@ -112,6 +112,20 @@ def pca_gpu(matrix):
     return coords
 
 
+def extract_dense_vector(raw_vector):
+    if isinstance(raw_vector, list):
+        return raw_vector
+    if isinstance(raw_vector, dict):
+        for value in raw_vector.values():
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = value.get("vector")
+                if isinstance(nested, list):
+                    return nested
+    return None
+
+
 def main():
     if len(sys.argv) < 4:
         print(json.dumps({"error": "usage: pca_gpu.py <collection> <limit> <qdrant_url>"}))
@@ -130,9 +144,20 @@ def main():
         print(json.dumps({"points": [], "total": 0}))
         return
 
-    # Extract vectors — skip points with missing/empty vectors
-    valid = [(p, np.array(p["vector"], dtype=np.float32))
-             for p in raw_points if p.get("vector")]
+    valid = []
+    skipped = 0
+    for p in raw_points:
+        vec = extract_dense_vector(p.get("vector"))
+        if not vec:
+            skipped += 1
+            continue
+        try:
+            valid.append((p, np.asarray(vec, dtype=np.float32)))
+        except (TypeError, ValueError):
+            skipped += 1
+
+    if skipped:
+        log(f"Skipped {skipped} points with non-dense or invalid vectors")
     if not valid:
         print(json.dumps({"points": [], "total": 0}))
         return

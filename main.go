@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -49,7 +50,7 @@ type scrollResultInner struct {
 
 type QPoint struct {
 	ID      interface{}            `json:"id"`
-	Vector  []float64              `json:"vector"`
+	Vector  interface{}            `json:"vector"`
 	Payload map[string]interface{} `json:"payload"`
 }
 
@@ -72,6 +73,53 @@ type collectionsListResult struct {
 			Name string `json:"name"`
 		} `json:"collections"`
 	} `json:"result"`
+}
+
+type pointsByIDRequest struct {
+	IDs         []interface{} `json:"ids"`
+	WithPayload bool          `json:"with_payload"`
+	WithVector  bool          `json:"with_vector"`
+}
+
+type pointsByIDResult struct {
+	Result []QPoint `json:"result"`
+	Status string   `json:"status"`
+}
+
+type searchPointsRequest struct {
+	Vector      interface{} `json:"vector"`
+	Limit       int         `json:"limit"`
+	WithPayload bool        `json:"with_payload"`
+}
+
+type searchPointHit struct {
+	ID      interface{}            `json:"id"`
+	Score   float64                `json:"score"`
+	Payload map[string]interface{} `json:"payload"`
+}
+
+type searchPointsResult struct {
+	Result []searchPointHit `json:"result"`
+	Status string           `json:"status"`
+}
+
+type namedSearchVector struct {
+	Name   string    `json:"name"`
+	Vector []float64 `json:"vector"`
+}
+
+type similarNeighbor struct {
+	ID      interface{}            `json:"id"`
+	Score   float64                `json:"score"`
+	Payload map[string]interface{} `json:"payload"`
+}
+
+type similarResponse struct {
+	SelectedID interface{}       `json:"selected_id"`
+	Collection string            `json:"collection"`
+	Limit      int               `json:"limit"`
+	VectorName string            `json:"vector_name,omitempty"`
+	Neighbors  []similarNeighbor `json:"neighbors"`
 }
 
 // ── API response types ────────────────────────────────────────────────────────
@@ -163,6 +211,119 @@ func (q *qdrantClient) collectionMeta(ctx context.Context, name string) (Collect
 	}, nil
 }
 
+func (q *qdrantClient) getPointByID(ctx context.Context, collection, pointID string) (*QPoint, error) {
+	idCandidates := []interface{}{pointID}
+	if n, err := strconv.ParseInt(pointID, 10, 64); err == nil {
+		idCandidates = append(idCandidates, n)
+	}
+
+	for _, idCandidate := range idCandidates {
+		req := pointsByIDRequest{
+			IDs:         []interface{}{idCandidate},
+			WithPayload: true,
+			WithVector:  true,
+		}
+		raw, status, err := q.do(ctx, http.MethodPost, "/collections/"+collection+"/points", req)
+		if err != nil {
+			return nil, err
+		}
+		if status >= 400 {
+			return nil, fmt.Errorf("qdrant %d: %s", status, string(raw))
+		}
+		var res pointsByIDResult
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return nil, fmt.Errorf("decode point lookup: %w", err)
+		}
+		if len(res.Result) > 0 {
+			return &res.Result[0], nil
+		}
+	}
+
+	return nil, nil
+}
+
+func parseSimilarityLimit(r *http.Request, fallback int) (int, error) {
+	limit := fallback
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("invalid limit: %q", raw)
+		}
+		limit = n
+	}
+	if r.Method == http.MethodPost && r.Body != nil {
+		var body struct {
+			Limit int `json:"limit"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			return 0, fmt.Errorf("invalid request body: %w", err)
+		}
+		if body.Limit > 0 {
+			limit = body.Limit
+		}
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	return limit, nil
+}
+
+func canonicalPointID(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		if t == float64(int64(t)) {
+			return strconv.FormatInt(int64(t), 10)
+		}
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(t)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case json.Number:
+		return t.String()
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+func pickSearchVector(raw interface{}) (interface{}, string) {
+	if vec := toFloatSlice(raw); len(vec) > 0 {
+		return vec, ""
+	}
+	obj, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, ""
+	}
+
+	keys := make([]string, 0, len(obj))
+	for key := range obj {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		if vec := toFloatSlice(obj[key]); len(vec) > 0 {
+			if key == "vector" {
+				return vec, ""
+			}
+			return namedSearchVector{Name: key, Vector: vec}, key
+		}
+		nested, ok := obj[key].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if vec := toFloatSlice(nested["vector"]); len(vec) > 0 {
+			if key == "vector" {
+				return vec, ""
+			}
+			return namedSearchVector{Name: key, Vector: vec}, key
+		}
+	}
+	return nil, ""
+}
+
 // ── GPU PCA via Python subprocess ─────────────────────────────────────────────
 
 // pythonBin returns the best available python binary
@@ -225,7 +386,7 @@ func main() {
 
 	qdrantURL := envOr("QDRANT_URL", "http://localhost:6333")
 	qdrantKey := os.Getenv("QDRANT_API_KEY")
-	port      := envOr("VECTORVIEW_PORT", "7433")
+	port := envOr("VECTORVIEW_PORT", "7433")
 	maxPoints, _ := strconv.Atoi(envOr("VECTORVIEW_MAX_POINTS", "2000"))
 	if maxPoints <= 0 {
 		maxPoints = 2000
@@ -321,10 +482,10 @@ func main() {
 
 		sreq := searchReq{
 			Filter: filterClause{Should: []filterMatch{
-				{Key: "text",       Match: matchValue{Text: queryStr}},
-				{Key: "content",    Match: matchValue{Text: queryStr}},
+				{Key: "text", Match: matchValue{Text: queryStr}},
+				{Key: "content", Match: matchValue{Text: queryStr}},
 				{Key: "chunk_text", Match: matchValue{Text: queryStr}},
-				{Key: "title",      Match: matchValue{Text: queryStr}},
+				{Key: "title", Match: matchValue{Text: queryStr}},
 			}},
 			Limit:       limit,
 			WithPayload: true,
@@ -343,7 +504,10 @@ func main() {
 		}
 
 		var res scrollResult
-		json.Unmarshal(raw, &res)
+		if err := json.Unmarshal(raw, &res); err != nil {
+			http.Error(w, fmt.Sprintf("decode scroll: %v", err), 500)
+			return
+		}
 
 		// Re-project the filtered points via inline Go PCA
 		// (search results are small enough — no need for GPU subprocess)
@@ -357,6 +521,88 @@ func main() {
 		json.NewEncoder(w).Encode(resp)
 	})
 
+	// GET|POST /api/collections/{collection}/points/{point_id}/similar?limit=N
+	mux.HandleFunc("/api/collections/{collection}/points/{point_id}/similar", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		collection := strings.TrimSpace(r.PathValue("collection"))
+		pointID := strings.TrimSpace(r.PathValue("point_id"))
+		if collection == "" || pointID == "" {
+			http.Error(w, "collection and point_id are required", http.StatusBadRequest)
+			return
+		}
+
+		limit, err := parseSimilarityLimit(r, 12)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		selected, err := q.getPointByID(r.Context(), collection, pointID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if selected == nil {
+			http.Error(w, "selected point not found", http.StatusNotFound)
+			return
+		}
+
+		searchVector, vectorName := pickSearchVector(selected.Vector)
+		if searchVector == nil {
+			http.Error(w, "selected point has no usable vector", http.StatusBadRequest)
+			return
+		}
+
+		// Use the selected point vector directly as the Qdrant similarity query.
+		sreq := searchPointsRequest{
+			Vector:      searchVector,
+			Limit:       limit + 1,
+			WithPayload: true,
+		}
+		raw, status, err := q.do(r.Context(), http.MethodPost,
+			"/collections/"+collection+"/points/search", sreq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if status >= 400 {
+			http.Error(w, fmt.Sprintf("qdrant %d: %s", status, string(raw)), http.StatusInternalServerError)
+			return
+		}
+
+		var searchRes searchPointsResult
+		if err := json.Unmarshal(raw, &searchRes); err != nil {
+			http.Error(w, fmt.Sprintf("decode similar search: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		selectedKey := canonicalPointID(selected.ID)
+		neighbors := make([]similarNeighbor, 0, limit)
+		for _, hit := range searchRes.Result {
+			if canonicalPointID(hit.ID) == selectedKey {
+				continue
+			}
+			neighbors = append(neighbors, similarNeighbor{ID: hit.ID, Score: hit.Score, Payload: hit.Payload})
+			if len(neighbors) >= limit {
+				break
+			}
+		}
+
+		resp := similarResponse{
+			SelectedID: selected.ID,
+			Collection: collection,
+			Limit:      limit,
+			VectorName: vectorName,
+			Neighbors:  neighbors,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	addr := ":" + port
 	log.Printf("🚀 VectorView running → http://localhost%s", addr)
 	log.Printf("   Qdrant: %s | GPU PCA script: %s | Max points: %d", qdrantURL, pcaScript(), maxPoints)
@@ -365,22 +611,78 @@ func main() {
 
 // ── Inline Go PCA for small search result sets ────────────────────────────────
 
-func goPCA3D(points []QPoint) []PointData {
-	valid := make([]QPoint, 0, len(points))
-	for _, p := range points {
-		if len(p.Vector) > 0 {
-			valid = append(valid, p)
+func toFloatSlice(v interface{}) []float64 {
+	switch t := v.(type) {
+	case []float64:
+		if len(t) == 0 {
+			return nil
+		}
+		return t
+	case []interface{}:
+		if len(t) == 0 {
+			return nil
+		}
+		out := make([]float64, 0, len(t))
+		for _, elem := range t {
+			n, ok := elem.(float64)
+			if !ok {
+				return nil
+			}
+			out = append(out, n)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func extractDenseVector(v interface{}) []float64 {
+	if vec := toFloatSlice(v); len(vec) > 0 {
+		return vec
+	}
+	obj, ok := v.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	for _, raw := range obj {
+		if vec := toFloatSlice(raw); len(vec) > 0 {
+			return vec
+		}
+		nested, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if vec := toFloatSlice(nested["vector"]); len(vec) > 0 {
+			return vec
 		}
 	}
+	return nil
+}
+
+func goPCA3D(points []QPoint) []PointData {
+	type projectedPoint struct {
+		raw    QPoint
+		vector []float64
+	}
+
+	valid := make([]projectedPoint, 0, len(points))
+	for _, p := range points {
+		vec := extractDenseVector(p.Vector)
+		if len(vec) == 0 {
+			continue
+		}
+		valid = append(valid, projectedPoint{raw: p, vector: vec})
+	}
+
 	n := len(valid)
 	if n == 0 {
 		return nil
 	}
-	dim := len(valid[0].Vector)
+	dim := len(valid[0].vector)
 
 	mean := make([]float64, dim)
 	for _, p := range valid {
-		for i, v := range p.Vector {
+		for i, v := range p.vector {
 			mean[i] += v
 		}
 	}
@@ -391,7 +693,7 @@ func goPCA3D(points []QPoint) []PointData {
 	centered := make([][]float64, n)
 	for i, p := range valid {
 		row := make([]float64, dim)
-		for j, v := range p.Vector {
+		for j, v := range p.vector {
 			row[j] = v - mean[j]
 		}
 		centered[i] = row
@@ -399,7 +701,6 @@ func goPCA3D(points []QPoint) []PointData {
 
 	comps := powerIteration(centered, n, dim, 3, 20)
 
-	// Project
 	coords := make([][3]float64, n)
 	for i, row := range centered {
 		for c, comp := range comps {
@@ -409,12 +710,15 @@ func goPCA3D(points []QPoint) []PointData {
 		}
 	}
 
-	// Normalize each axis to [-100, 100]
 	for axis := 0; axis < 3; axis++ {
 		mn, mx := coords[0][axis], coords[0][axis]
 		for i := 1; i < n; i++ {
-			if coords[i][axis] < mn { mn = coords[i][axis] }
-			if coords[i][axis] > mx { mx = coords[i][axis] }
+			if coords[i][axis] < mn {
+				mn = coords[i][axis]
+			}
+			if coords[i][axis] > mx {
+				mx = coords[i][axis]
+			}
 		}
 		r := mx - mn
 		for i := range coords {
@@ -429,11 +733,11 @@ func goPCA3D(points []QPoint) []PointData {
 	out := make([]PointData, n)
 	for i, p := range valid {
 		out[i] = PointData{
-			ID:      p.ID,
+			ID:      p.raw.ID,
 			X:       coords[i][0],
 			Y:       coords[i][1],
 			Z:       coords[i][2],
-			Payload: p.Payload,
+			Payload: p.raw.Payload,
 		}
 	}
 	return out
@@ -460,16 +764,24 @@ func powerIteration(data [][]float64, n, dim, k, iters int) [][]float64 {
 				}
 			}
 			norm := 0.0
-			for _, x := range newV { norm += x * x }
+			for _, x := range newV {
+				norm += x * x
+			}
 			norm = goSqrt(norm)
-			if norm < 1e-10 { break }
-			for j := range newV { newV[j] /= norm }
+			if norm < 1e-10 {
+				break
+			}
+			for j := range newV {
+				newV[j] /= norm
+			}
 			v = newV
 		}
 		comps = append(comps, v)
 		for i, row := range deflated {
 			proj := dotProduct(row, v)
-			for j := range row { deflated[i][j] -= proj * v[j] }
+			for j := range row {
+				deflated[i][j] -= proj * v[j]
+			}
 		}
 	}
 	return comps
@@ -478,20 +790,28 @@ func powerIteration(data [][]float64, n, dim, k, iters int) [][]float64 {
 func dotProduct(a, b []float64) float64 {
 	s := 0.0
 	for i := range a {
-		if i < len(b) { s += a[i] * b[i] }
+		if i < len(b) {
+			s += a[i] * b[i]
+		}
 	}
 	return s
 }
 
 func goSqrt(x float64) float64 {
-	if x <= 0 { return 0 }
+	if x <= 0 {
+		return 0
+	}
 	z := x
-	for i := 0; i < 50; i++ { z = (z + x/z) / 2 }
+	for i := 0; i < 50; i++ {
+		z = (z + x/z) / 2
+	}
 	return z
 }
 
 func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" { return v }
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
 	return def
 }
 

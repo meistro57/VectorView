@@ -41,11 +41,14 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 **Exploration**
 - Orbit, zoom, and pan with mouse — smooth damped controls
 - Click any particle to inspect its full Qdrant payload in the HUD
-- Hover preview — point inspector updates as you sweep across the cloud
+- Signal Scanner: run **Find Similar** on the selected point to fetch nearest neighbors from Qdrant
+- Similarity highlight mode: selected signal pulses, neighbor signals brighten, unrelated points fade
+- Similar Signals side list with rank, score, snippet, and click-to-focus for loaded points
+- Hover preview — inspector updates as you sweep when no point is pinned
 - Payload text search — keyword scan returns a filtered sub-cloud, re-projected live
 
 **Controls**
-- Real-time sliders: point size, opacity, bloom strength, auto-rotation speed
+- Real-time sliders: point count, point size, opacity, bloom strength, auto-rotation speed, hue shift, saturation, lightness
 - Collection picker — switch between all Qdrant collections without restarting
 - Reload button — re-pull latest vectors on demand
 
@@ -123,7 +126,7 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 │        │                                        │           │
 │ Legend │                                        │           │
 ├────────┴────────────────────────────────────────┴───────────┤
-│  [ Search payload text... ]              [ SCAN ]           │  ← Bottom HUD
+│  [ Search memory text... ]               [ SCAN ]           │  ← Bottom HUD
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -132,8 +135,12 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | Left drag | Orbit |
 | Right drag | Pan |
 | Scroll wheel | Zoom |
-| Click particle | Inspect full payload |
-| Hover particle | Quick preview |
+| Click particle | Pin signal in inspector |
+| FIND SIMILAR | Run nearest-neighbor scan in current collection |
+| CLEAR SCAN | Exit highlight mode and restore normal cloud |
+| Point Count slider | Reload cloud with selected sample size |
+| Hue / Saturation / Lightness | Live palette remapping without reloading |
+| Hover particle | Quick preview (when no pinned signal) |
 | Search + SCAN | Filter to matching points |
 | Collection picker | Switch active collection |
 | ↺ RELOAD | Re-pull vectors from Qdrant |
@@ -144,11 +151,32 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 
 VectorView uses a **hybrid PCA pipeline**:
 
-1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, runs PCA through PyTorch/CuPy when available (NumPy randomized SVD fallback), and returns normalized 3D coordinates.
-2. **`/api/search` path (filtered subset):** Go performs inline power-iteration PCA for fast small-result reprojection without spawning Python.
+1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, extracts usable dense vectors (including simple named-vector shapes), runs PCA through PyTorch/CuPy when available (NumPy randomized SVD fallback), and returns normalized 3D coordinates.
+2. **`/api/search` path (filtered subset):** Go performs inline power-iteration PCA for fast small-result reprojection without spawning Python, using the same dense-vector extraction fallback.
 3. **Normalize** — both paths scale coordinates into a ±100 unit cube for comfortable viewing.
 
 The result: semantically similar points cluster together in 3D space. The geometry you see **is** the structure of your knowledge base.
+
+---
+
+## 📡 Signal Scanner
+
+Signal Scanner turns the inspector into a neighborhood probe:
+
+1. Load a collection.
+2. Click a point to pin it in **Signal Inspector**.
+3. Press **FIND SIMILAR**.
+4. VectorView fetches nearest neighbors from Qdrant using the selected point's vector.
+5. The selected signal pulses, similar signals brighten, and unrelated points dim.
+6. Review neighbors in **Similar Signals**; click one to focus it when present in the loaded sample.
+
+### Similarity assumptions and limits
+
+- Endpoint uses the selected point vector directly against `/points/search` in the same collection.
+- If vectors are named, VectorView picks the first detected named vector key from the selected point payload and sends `{name, vector}`.
+- `limit` defaults to `12` and is capped to `200` server-side.
+- If neighbors are returned by Qdrant but not present in the currently loaded point sample, they still appear in the Similar Signals list and are marked as outside the visible sample.
+- Current search endpoint remains payload-text search; it does not yet combine keyword scan + nearest-neighbor reranking.
 
 ---
 
@@ -157,9 +185,11 @@ The result: semantically similar points cluster together in 3D space. The geomet
 VectorView exposes a small REST API that the frontend uses — useful for scripting or integration:
 
 ```
-GET  /api/collections                     → list all Qdrant collections with metadata
-GET  /api/points?collection=X&limit=N     → full-collection projection via Python PCA worker
-GET  /api/search?collection=X&q=term      → payload keyword search + inline Go PCA reprojection
+GET  /api/collections                                                → list all Qdrant collections with metadata
+GET  /api/points?collection=X&limit=N                                → full-collection projection via Python PCA worker
+GET  /api/search?collection=X&q=term                                 → payload keyword search + inline Go PCA reprojection
+GET  /api/collections/{collection}/points/{point_id}/similar?limit=N → nearest-neighbor scan from selected point vector
+POST /api/collections/{collection}/points/{point_id}/similar         → same as above (JSON body supports {"limit": N})
 ```
 
 Example response from `/api/points`:
@@ -169,6 +199,28 @@ Example response from `/api/points`:
     { "id": 123, "x": 14.2, "y": -7.8, "z": 3.1, "payload": { "entity_type": "chunk", "text": "..." } }
   ],
   "total": 847
+}
+```
+
+Example response from `/api/collections/{collection}/points/{point_id}/similar`:
+```json
+{
+  "selected_id": "abc123",
+  "collection": "meistro_brain",
+  "limit": 12,
+  "vector_name": "default",
+  "neighbors": [
+    {
+      "id": "def456",
+      "score": 0.874,
+      "payload": {
+        "title": "Example title",
+        "text": "Example text...",
+        "date": "2025-01-17",
+        "file_source": "example.json"
+      }
+    }
+  ]
 }
 ```
 

@@ -177,6 +177,111 @@
   .insp-val { color: var(--text); word-break: break-word; }
   .insp-val.highlight { color: var(--neon-g); }
 
+  #inspector-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+  }
+
+  .scan-btn {
+    flex: 1;
+    background: transparent;
+    border: 1px solid var(--neon-c);
+    color: var(--neon-c);
+    font-family: var(--font-mono);
+    font-size: 0.64rem;
+    letter-spacing: 0.08em;
+    padding: 6px 8px;
+    cursor: pointer;
+    transition: background 0.2s, opacity 0.2s;
+  }
+
+  .scan-btn:hover { background: #00f5ff1a; }
+
+  .scan-btn.secondary {
+    border-color: var(--neon-m);
+    color: var(--neon-m);
+  }
+
+  .scan-btn.secondary:hover { background: #ff00ff1a; }
+
+  .scan-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    background: transparent;
+  }
+
+  #scan-status {
+    min-height: 16px;
+    font-size: 0.64rem;
+    color: var(--dim);
+    line-height: 1.35;
+  }
+
+  #similar-signals { margin-top: 2px; }
+
+  #similar-empty {
+    color: var(--dim);
+    font-size: 0.68rem;
+    line-height: 1.5;
+    padding: 6px 0;
+  }
+
+  #similar-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .similar-item {
+    border: 1px solid var(--border);
+    background: #080d1a;
+    padding: 8px;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+  }
+
+  .similar-item:hover {
+    border-color: var(--neon-c);
+    background: #0c152b;
+  }
+
+  .similar-item.offscreen {
+    cursor: default;
+    opacity: 0.7;
+  }
+
+  .similar-item.offscreen:hover {
+    border-color: var(--border);
+    background: #080d1a;
+  }
+
+  .similar-rank {
+    font-family: var(--font-hud);
+    font-size: 0.62rem;
+    letter-spacing: 0.12em;
+    color: var(--neon-c);
+  }
+
+  .similar-title {
+    font-size: 0.72rem;
+    color: var(--text);
+    margin-top: 2px;
+  }
+
+  .similar-meta {
+    margin-top: 4px;
+    font-size: 0.62rem;
+    color: var(--dim);
+  }
+
+  .similar-snippet {
+    margin-top: 5px;
+    font-size: 0.66rem;
+    color: #9eb2d6;
+    line-height: 1.45;
+  }
+
   /* Bottom — search */
   #hud-bottom {
     bottom: 0; left: 0; right: 0;
@@ -305,6 +410,11 @@
   <div class="panel-title">⬡ Controls</div>
 
   <div class="ctrl-row">
+    <label>Point Count <span id="val-point-limit">2000</span></label>
+    <input type="range" id="ctrl-point-limit" min="500" max="20000" step="500" value="2000">
+  </div>
+
+  <div class="ctrl-row">
     <label>Point Size <span id="val-size">6.0</span></label>
     <input type="range" id="ctrl-size" min="1" max="12" step="0.1" value="6.0">
   </div>
@@ -325,8 +435,23 @@
   </div>
 
   <div class="ctrl-row">
-    <label>Rotation Speed <span id="val-speed">0.2</span></label>
-    <input type="range" id="ctrl-speed" min="0" max="2" step="0.05" value="0.2">
+    <label>Rotation Speed <span id="val-speed">0.05</span></label>
+    <input type="range" id="ctrl-speed" min="0" max="2" step="0.05" value="0.05">
+  </div>
+
+  <div class="ctrl-row">
+    <label>Hue Shift <span id="val-hue">0°</span></label>
+    <input type="range" id="ctrl-hue" min="-180" max="180" step="1" value="0">
+  </div>
+
+  <div class="ctrl-row">
+    <label>Saturation <span id="val-saturation">1.00</span></label>
+    <input type="range" id="ctrl-saturation" min="0" max="2" step="0.05" value="1">
+  </div>
+
+  <div class="ctrl-row">
+    <label>Lightness <span id="val-lightness">1.00</span></label>
+    <input type="range" id="ctrl-lightness" min="0.4" max="1.6" step="0.05" value="1">
   </div>
 
   <div class="panel-title">⬡ Legend</div>
@@ -343,14 +468,24 @@
 
 <!-- Right HUD — Inspector -->
 <div class="hud" id="hud-right">
-  <div class="panel-title">⬡ Point Inspector</div>
+  <div class="panel-title">⬡ Signal Inspector</div>
   <div id="inspector-empty">Hover or click a point<br>to inspect its payload</div>
   <div id="inspector-content"></div>
+  <div id="inspector-actions">
+    <button id="btn-find-similar" class="scan-btn" disabled>FIND SIMILAR</button>
+    <button id="btn-clear-scan" class="scan-btn secondary" disabled>CLEAR SCAN</button>
+  </div>
+  <div id="scan-status"></div>
+  <div id="similar-signals">
+    <div class="panel-title">⬡ Similar Signals</div>
+    <div id="similar-empty">Select a point and run Find Similar.</div>
+    <div id="similar-list"></div>
+  </div>
 </div>
 
 <!-- Bottom HUD -->
 <div class="hud" id="hud-bottom">
-  <input type="text" id="search-input" placeholder="Search payload text…" />
+  <input type="text" id="search-input" placeholder="Search memory text..." />
   <button id="btn-search">SCAN</button>
   <span id="search-status"></span>
 </div>
@@ -378,7 +513,7 @@ class OrbitControls {
     this.zoomSpeed = 1.2;
     this.panSpeed = 0.8;
     this.autoRotate = true;
-    this.autoRotateSpeed = 0.2;
+    this.autoRotateSpeed = 0.05;
 
     this._spherical = new THREE.Spherical();
     this._sphericalDelta = new THREE.Spherical();
@@ -484,13 +619,25 @@ let glowSystem = null;
 let nebulaSystem = null;
 let allPoints = [];
 let currentCollection = 'meistro_brain';
-let animAutoRotate = true;
+let pointLimit = 2000;
 let pointSize = 6.0;
 let coreOpacity = 0.85;
 let hazeOpacity = 0.55;
 let bloomStrength = 2.5;
-let rotSpeed = 0.2;
-let hovered = -1;
+let rotSpeed = 0.05;
+let hueShift = 0;
+let saturationMult = 1;
+let lightnessMult = 1;
+let pointClusterIndices = [];
+let activeClusterMap = null;
+let pointIndexByID = new Map();
+let basePointColors = null;
+let basePointSizes = null;
+let selectedPoint = null;
+let selectedPointID = '';
+let similarityModeActive = false;
+let scanNeighborIDs = new Set();
+let scanResults = [];
 const raycaster = new THREE.Raycaster();
 raycaster.params.Points.threshold = 3.0;
 const mouse = new THREE.Vector2(-9999, -9999);
@@ -501,6 +648,51 @@ const PALETTE = [
   0xffff00, 0x7b2fff, 0xff2d55, 0x00ff88,
   0xff9500, 0x0099ff,
 ];
+
+function getAdjustedPaletteColor(index, outColor = new THREE.Color()) {
+  outColor.setHex(PALETTE[index % PALETTE.length]);
+  const hsl = { h: 0, s: 0, l: 0 };
+  outColor.getHSL(hsl);
+  hsl.h = (hsl.h + hueShift / 360 + 1) % 1;
+  hsl.s = Math.min(1, Math.max(0, hsl.s * saturationMult));
+  hsl.l = Math.min(1, Math.max(0, hsl.l * lightnessMult));
+  outColor.setHSL(hsl.h, hsl.s, hsl.l);
+  return outColor;
+}
+
+function pointIDKey(id) {
+  if (id === null || id === undefined) return '';
+  if (typeof id === 'number' && Number.isFinite(id) && Number.isInteger(id)) {
+    return String(id);
+  }
+  return String(id);
+}
+
+function refreshPointColors() {
+  if (!particleSystem || pointClusterIndices.length === 0) return;
+  const colorAttr = particleSystem.geometry.attributes.color;
+  if (!colorAttr) return;
+
+  const c = new THREE.Color();
+  if (!basePointColors || basePointColors.length !== colorAttr.array.length) {
+    basePointColors = new Float32Array(colorAttr.array.length);
+  }
+  for (let i = 0; i < pointClusterIndices.length; i++) {
+    getAdjustedPaletteColor(pointClusterIndices[i], c);
+    basePointColors[i * 3] = c.r;
+    basePointColors[i * 3 + 1] = c.g;
+    basePointColors[i * 3 + 2] = c.b;
+  }
+
+  if (similarityModeActive) {
+    applySignalScanHighlight();
+  } else {
+    colorAttr.array.set(basePointColors);
+    colorAttr.needsUpdate = true;
+  }
+
+  if (activeClusterMap) buildLegend(activeClusterMap);
+}
 
 // ── Init Three.js ─────────────────────────────────────────────────────────────
 function initScene() {
@@ -573,7 +765,7 @@ function onClick(e) {
   const hits = raycaster.intersectObject(particleSystem);
   if (hits.length > 0) {
     const idx = hits[0].index;
-    showInspector(allPoints[idx]);
+    selectPointByIndex(idx);
   }
 }
 
@@ -598,6 +790,9 @@ function buildParticles(points) {
   const positions = new Float32Array(n * 3);
   const colors    = new Float32Array(n * 3);
   const sizes     = new Float32Array(n);
+  const scanFlags = new Float32Array(n);
+
+  pointIndexByID = new Map();
 
   let minX = Infinity, maxX = -Infinity;
   let minY = Infinity, maxY = -Infinity;
@@ -622,6 +817,7 @@ function buildParticles(points) {
     clusterMap.get(key).count++;
   }
 
+  pointClusterIndices = new Array(n);
   const c = new THREE.Color();
   for (let i = 0; i < n; i++) {
     const p = points[i];
@@ -631,28 +827,54 @@ function buildParticles(points) {
 
     const key = extractClusterKey(p);
     const ci  = clusterMap.get(key).index % PALETTE.length;
-    c.setHex(PALETTE[ci]);
+    pointClusterIndices[i] = ci;
+    getAdjustedPaletteColor(ci, c);
     colors[i*3] = c.r; colors[i*3+1] = c.g; colors[i*3+2] = c.b;
 
     sizes[i] = pointSize;
+    scanFlags[i] = 0;
+    pointIndexByID.set(pointIDKey(p.id), i);
   }
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geo.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
   geo.setAttribute('size',     new THREE.BufferAttribute(sizes, 1));
+  geo.setAttribute('scanFlag', new THREE.BufferAttribute(scanFlags, 1));
 
   const VERT = `
       attribute float size;
+      attribute float scanFlag;
       varying vec3 vColor;
+      varying float vScanAlpha;
+      varying float vScanBoost;
       uniform float uTime;
       uniform float uSizeMult;
       void main() {
         vColor = color;
+        vScanAlpha = 1.0;
+        vScanBoost = 1.0;
+        float scanSize = 1.0;
+        float strongPulse = 1.0 + 0.26 * sin(uTime * 5.0 + position.x * 0.04 + position.z * 0.04);
+
+        if (scanFlag > 0.5 && scanFlag < 1.5) {
+          vScanAlpha = 0.14;
+          vScanBoost = 0.25;
+          scanSize = 0.8;
+        } else if (scanFlag >= 1.5 && scanFlag < 2.5) {
+          vScanAlpha = 1.0;
+          vScanBoost = 1.55;
+          scanSize = 1.35;
+        } else if (scanFlag >= 2.5) {
+          vScanAlpha = 1.0;
+          vScanBoost = 2.0 * strongPulse;
+          scanSize = 1.6 * strongPulse;
+        }
+
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
         float vDist = -mv.z;
         float pulse = 1.0 + 0.12 * sin(uTime * 1.8 + position.x * 0.07 + position.z * 0.05);
-        gl_PointSize = size * uSizeMult * pulse * (400.0 / max(vDist, 1.0));
+        gl_PointSize = size * scanSize * uSizeMult * pulse * (400.0 / max(vDist, 1.0));
         gl_PointSize = clamp(gl_PointSize, 1.0, 512.0);
         gl_Position  = projectionMatrix * mv;
       }
@@ -660,6 +882,8 @@ function buildParticles(points) {
 
   const CORE_FRAG = `
       varying vec3 vColor;
+      varying float vScanAlpha;
+      varying float vScanBoost;
       uniform float uOpacity;
       uniform float uBloom;
       void main() {
@@ -675,14 +899,16 @@ function buildParticles(points) {
         vec3 ringCol = mix(vColor, vec3(1.0), 0.65) * uBloom;
         vec3 rimCol = vColor * 0.5;
 
-        vec3 col = coreCol * coreMask + ringCol * ringMask + rimCol * rimMask;
-        float alpha = (coreMask + ringMask + rimMask * 0.8) * uOpacity;
+        vec3 col = (coreCol * coreMask + ringCol * ringMask + rimCol * rimMask) * vScanBoost;
+        float alpha = (coreMask + ringMask + rimMask * 0.8) * uOpacity * vScanAlpha;
         gl_FragColor = vec4(col, alpha);
       }
     `;
 
   const HAZE_FRAG = `
       varying vec3 vColor;
+      varying float vScanAlpha;
+      varying float vScanBoost;
       uniform float uOpacity;
       uniform float uBloom;
       void main() {
@@ -690,13 +916,15 @@ function buildParticles(points) {
         float d = length(uv);
         if (d > 0.5) discard;
         float emit = pow(max(1.0 - d * 2.0, 0.0), 2.2);
-        vec3 col = vColor * emit * uBloom;
-        gl_FragColor = vec4(col, emit * uOpacity);
+        vec3 col = vColor * emit * uBloom * vScanBoost;
+        gl_FragColor = vec4(col, emit * uOpacity * vScanAlpha);
       }
     `;
 
   const GLOW_FRAG = `
       varying vec3 vColor;
+      varying float vScanAlpha;
+      varying float vScanBoost;
       uniform float uOpacity;
       uniform float uBloom;
       void main() {
@@ -704,13 +932,15 @@ function buildParticles(points) {
         float d = length(uv);
         if (d > 0.5) discard;
         float g = exp(-d * d * 14.0);
-        vec3 col = vColor * g * uBloom;
-        gl_FragColor = vec4(col, g * uOpacity);
+        vec3 col = vColor * g * uBloom * vScanBoost;
+        gl_FragColor = vec4(col, g * uOpacity * vScanAlpha);
       }
     `;
 
   const NEBULA_FRAG = `
       varying vec3 vColor;
+      varying float vScanAlpha;
+      varying float vScanBoost;
       uniform float uOpacity;
       uniform float uBloom;
       void main() {
@@ -718,8 +948,8 @@ function buildParticles(points) {
         float d = length(uv);
         if (d > 0.5) discard;
         float g = exp(-d * d * 4.0);
-        vec3 col = vColor * g * uBloom;
-        gl_FragColor = vec4(col, g * uOpacity);
+        vec3 col = vColor * g * uBloom * vScanBoost;
+        gl_FragColor = vec4(col, g * uOpacity * vScanAlpha);
       }
     `;
 
@@ -748,6 +978,7 @@ function buildParticles(points) {
   scene.add(hazeSystem);
   scene.add(particleSystem);
 
+  activeClusterMap = clusterMap;
   buildLegend(clusterMap);
 
   document.getElementById('stat-points').textContent  = n.toLocaleString();
@@ -755,6 +986,13 @@ function buildParticles(points) {
   document.getElementById('stat-collection').textContent = currentCollection;
 
   allPoints = points;
+  basePointColors = new Float32Array(colors);
+  basePointSizes = new Float32Array(sizes);
+  selectedPoint = null;
+  selectedPointID = '';
+  lastHoverIdx = -1;
+  resetSignalScannerUI();
+  applySignalScanHighlight();
   autoFitCamera();
 }
 
@@ -791,8 +1029,10 @@ function buildLegend(clusterMap) {
     .sort((a, b) => b[1].count - a[1].count);
 
   const top = sorted.slice(0, 10);
+  const colorObj = new THREE.Color();
   for (const [key, meta] of top) {
-    const color = '#' + PALETTE[meta.index % PALETTE.length].toString(16).padStart(6, '0');
+    getAdjustedPaletteColor(meta.index % PALETTE.length, colorObj);
+    const color = '#' + colorObj.getHexString();
     el.innerHTML += `<div class="legend-item">
       <div class="legend-dot" style="background:${color};box-shadow:0 0 6px ${color}"></div>
       <span style="color:var(--text)">${key} <span style="color:var(--dim)">(${meta.count})</span></span>
@@ -806,31 +1046,228 @@ function buildLegend(clusterMap) {
 }
 
 // ── Inspector ─────────────────────────────────────────────────────────────────
-function showInspector(pt) {
+function escapeHTML(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function shortText(value, maxLen) {
+  const s = String(value ?? '');
+  return s.length > maxLen ? s.slice(0, maxLen) + '…' : s;
+}
+
+function getSignalTitle(payload, fallbackID) {
+  return payload?.title || payload?.source_id || payload?.file_source || `Signal ${fallbackID}`;
+}
+
+function getSignalSnippet(payload) {
+  return payload?.text || payload?.content || payload?.chunk_text || payload?.summary || 'No preview text available.';
+}
+
+function setScanStatus(message, kind = 'muted') {
+  const el = document.getElementById('scan-status');
+  el.textContent = message || '';
+  if (kind === 'error') {
+    el.style.color = 'var(--neon-o)';
+  } else if (kind === 'ok') {
+    el.style.color = 'var(--neon-g)';
+  } else {
+    el.style.color = 'var(--dim)';
+  }
+}
+
+function showInspector(pt, mode = 'selected') {
   if (!pt) return;
   document.getElementById('inspector-empty').style.display = 'none';
   const el = document.getElementById('inspector-content');
   el.classList.add('active');
 
   const payload = pt.payload || {};
-  let html = `<div class="insp-field"><div class="insp-key">ID</div><div class="insp-val highlight">${pt.id}</div></div>`;
+  const modeLabel = mode === 'hover' ? 'HOVER' : 'SELECTED';
+  let html = `<div class="insp-field"><div class="insp-key">Signal</div><div class="insp-val highlight">${modeLabel}</div></div>`;
+  html += `<div class="insp-field"><div class="insp-key">ID</div><div class="insp-val highlight">${escapeHTML(pt.id)}</div></div>`;
   html += `<div class="insp-field"><div class="insp-key">PCA Coords</div><div class="insp-val">${pt.x.toFixed(3)}, ${pt.y.toFixed(3)}, ${pt.z.toFixed(3)}</div></div>`;
 
   const priority = ['entity_type', 'source_id', 'title', 'text', 'content', 'chunk_text', 'author', 'timestamp'];
   const shown = new Set();
   for (const k of priority) {
     if (payload[k] !== undefined) {
-      const v = String(payload[k]);
-      html += `<div class="insp-field"><div class="insp-key">${k}</div><div class="insp-val">${v.length > 200 ? v.slice(0, 200) + '…' : v}</div></div>`;
+      const v = shortText(payload[k], 200);
+      html += `<div class="insp-field"><div class="insp-key">${escapeHTML(k)}</div><div class="insp-val">${escapeHTML(v)}</div></div>`;
       shown.add(k);
     }
   }
   for (const [k, v] of Object.entries(payload)) {
     if (shown.has(k)) continue;
-    const sv = String(v);
-    html += `<div class="insp-field"><div class="insp-key">${k}</div><div class="insp-val">${sv.length > 120 ? sv.slice(0, 120) + '…' : sv}</div></div>`;
+    const sv = shortText(v, 120);
+    html += `<div class="insp-field"><div class="insp-key">${escapeHTML(k)}</div><div class="insp-val">${escapeHTML(sv)}</div></div>`;
   }
   el.innerHTML = html;
+}
+
+function focusPointByIndex(index) {
+  if (!particleSystem || !controls || !camera || index < 0) return;
+  const pos = particleSystem.geometry.attributes.position.array;
+  const target = new THREE.Vector3(pos[index * 3], pos[index * 3 + 1], pos[index * 3 + 2]);
+  const distance = Math.max(60, camera.position.distanceTo(controls.target));
+  const direction = camera.position.clone().sub(controls.target).normalize();
+  controls.target.copy(target);
+  camera.position.copy(target.clone().add(direction.multiplyScalar(distance)));
+  if (typeof controls._updateSpherical === 'function') controls._updateSpherical();
+}
+
+function updateSignalButtons() {
+  const hasSelection = !!selectedPoint;
+  document.getElementById('btn-find-similar').disabled = !hasSelection;
+  document.getElementById('btn-clear-scan').disabled = !similarityModeActive;
+}
+
+function applySignalScanHighlight() {
+  if (!particleSystem || !basePointColors || !basePointSizes) return;
+  const colorAttr = particleSystem.geometry.attributes.color;
+  const sizeAttr = particleSystem.geometry.attributes.size;
+  const scanAttr = particleSystem.geometry.attributes.scanFlag;
+  if (!colorAttr || !sizeAttr || !scanAttr) return;
+
+  // Point highlighting mode uses scanFlag: 0=normal, 1=dimmed, 2=similar, 3=selected.
+  colorAttr.array.set(basePointColors);
+  sizeAttr.array.set(basePointSizes);
+  scanAttr.array.fill(0);
+
+  if (similarityModeActive) {
+    for (let i = 0; i < allPoints.length; i++) {
+      const id = pointIDKey(allPoints[i].id);
+      if (id === selectedPointID) {
+        scanAttr.array[i] = 3;
+      } else if (scanNeighborIDs.has(id)) {
+        scanAttr.array[i] = 2;
+      } else {
+        scanAttr.array[i] = 1;
+      }
+    }
+  }
+
+  colorAttr.needsUpdate = true;
+  sizeAttr.needsUpdate = true;
+  scanAttr.needsUpdate = true;
+}
+
+function resetSignalScannerUI() {
+  similarityModeActive = false;
+  scanNeighborIDs = new Set();
+  scanResults = [];
+  setScanStatus('');
+  document.getElementById('similar-list').innerHTML = '';
+  document.getElementById('similar-empty').style.display = 'block';
+  document.getElementById('similar-empty').textContent = 'Select a point and run Find Similar.';
+  updateSignalButtons();
+}
+
+function clearSignalScan() {
+  similarityModeActive = false;
+  scanNeighborIDs = new Set();
+  scanResults = [];
+  applySignalScanHighlight();
+  renderSimilarSignals([]);
+  setScanStatus('Scan cleared.', 'muted');
+  updateSignalButtons();
+}
+
+function renderSimilarSignals(results) {
+  const list = document.getElementById('similar-list');
+  const empty = document.getElementById('similar-empty');
+  list.innerHTML = '';
+
+  if (!results || results.length === 0) {
+    empty.style.display = 'block';
+    empty.textContent = similarityModeActive ? 'No neighbors returned.' : 'Select a point and run Find Similar.';
+    return;
+  }
+
+  empty.style.display = 'none';
+  for (let i = 0; i < results.length; i++) {
+    const row = results[i];
+    const idKey = pointIDKey(row.id);
+    const idx = pointIndexByID.get(idKey);
+    const payload = row.payload || {};
+    const title = shortText(getSignalTitle(payload, row.id), 80);
+    const snippet = shortText(getSignalSnippet(payload), 120);
+    const source = payload.file_source || payload.source || payload.date || 'unknown source';
+    const offscreen = idx === undefined;
+
+    const item = document.createElement('div');
+    item.className = `similar-item${offscreen ? ' offscreen' : ''}`;
+    item.innerHTML = `
+      <div class="similar-rank">${i + 1}. SIGNAL ${escapeHTML(row.id)}</div>
+      <div class="similar-title">${escapeHTML(title)}</div>
+      <div class="similar-meta">score: ${(Number(row.score) || 0).toFixed(3)} · ${escapeHTML(shortText(source, 38))}</div>
+      <div class="similar-snippet">${escapeHTML(snippet)}</div>
+      ${offscreen ? '<div class="similar-meta">not in current visible sample</div>' : ''}
+    `;
+    if (!offscreen) {
+      item.addEventListener('click', () => {
+        selectPointByIndex(idx);
+        focusPointByIndex(idx);
+      });
+    }
+    list.appendChild(item);
+  }
+}
+
+function selectPointByIndex(index) {
+  if (index < 0 || index >= allPoints.length) return;
+  selectedPoint = allPoints[index];
+  selectedPointID = pointIDKey(selectedPoint.id);
+  showInspector(selectedPoint, 'selected');
+  updateSignalButtons();
+  if (similarityModeActive) {
+    applySignalScanHighlight();
+  }
+}
+
+async function runFindSimilar() {
+  if (!selectedPoint || !selectedPointID) {
+    setScanStatus('Select a signal first.', 'error');
+    return;
+  }
+
+  setScanStatus('Querying nearest neighbors...', 'muted');
+  try {
+    // Query backend similarity endpoint, which uses selected point vector for Qdrant nearest-neighbor search.
+    const res = await fetch(`/api/collections/${encodeURIComponent(currentCollection)}/points/${encodeURIComponent(selectedPointID)}/similar?limit=12`);
+    if (!res.ok) {
+      const message = await res.text();
+      throw new Error(message || 'similar search failed');
+    }
+
+    const data = await res.json();
+    scanResults = Array.isArray(data.neighbors) ? data.neighbors : [];
+    scanNeighborIDs = new Set(scanResults.map((n) => pointIDKey(n.id)));
+    similarityModeActive = true;
+    applySignalScanHighlight();
+    renderSimilarSignals(scanResults);
+
+    let visibleHits = 0;
+    for (const id of scanNeighborIDs) {
+      if (pointIndexByID.has(id)) visibleHits++;
+    }
+    const offscreen = scanResults.length - visibleHits;
+    const note = offscreen > 0 ? ` · ${offscreen} outside visible sample` : '';
+    setScanStatus(`${scanResults.length} similar signals · ${visibleHits} highlighted${note}`, 'ok');
+  } catch (err) {
+    similarityModeActive = false;
+    scanNeighborIDs = new Set();
+    scanResults = [];
+    applySignalScanHighlight();
+    renderSimilarSignals([]);
+    setScanStatus(`Scan failed: ${err.message}`, 'error');
+  }
+
+  updateSignalButtons();
 }
 
 // ── Raycasting hover ──────────────────────────────────────────────────────────
@@ -844,7 +1281,9 @@ function checkHover() {
     lastHoverIdx = idx;
     if (idx >= 0) {
       renderer.domElement.style.cursor = 'pointer';
-      showInspector(allPoints[idx]);
+      if (!selectedPoint) {
+        showInspector(allPoints[idx], 'hover');
+      }
     } else {
       renderer.domElement.style.cursor = 'default';
     }
@@ -894,24 +1333,36 @@ async function loadCollections() {
     const cols = await res.json();
     const sel = document.getElementById('collection-select');
     sel.innerHTML = '';
+    let selectedName = '';
     for (const c of cols) {
       const opt = document.createElement('option');
       opt.value = c.name;
       opt.textContent = `${c.name} (${c.points_count?.toLocaleString() ?? '?'} pts)`;
-      if (c.name === 'meistro_brain') opt.selected = true;
+      if (c.name === currentCollection) {
+        opt.selected = true;
+        selectedName = c.name;
+      }
       sel.appendChild(opt);
     }
-    currentCollection = sel.value;
+    if (!selectedName && cols.length > 0) {
+      selectedName = cols[0].name;
+      sel.value = selectedName;
+    }
+    currentCollection = selectedName || currentCollection;
   } catch (e) {
     console.warn('Could not load collections:', e);
   }
 }
 
-async function loadPoints(collection, limit = 2000) {
+async function loadPoints(collection, limit = pointLimit) {
   document.getElementById('loading').classList.remove('hidden');
   document.getElementById('loading-sub').textContent = `PULLING ${limit} VECTORS FROM ${collection.toUpperCase()}…`;
   try {
     const res = await fetch(`/api/points?collection=${encodeURIComponent(collection)}&limit=${limit}`);
+    if (!res.ok) {
+      const message = await res.text();
+      throw new Error(message || 'failed to load points');
+    }
     const data = await res.json();
     buildParticles(data.points || []);
   } catch(e) {
@@ -923,13 +1374,21 @@ async function loadPoints(collection, limit = 2000) {
 
 async function doSearch() {
   const q = document.getElementById('search-input').value.trim();
-  if (!q) { loadPoints(currentCollection); return; }
+  if (!q) {
+    await loadPoints(currentCollection, pointLimit);
+    document.getElementById('search-status').textContent = '';
+    return;
+  }
   document.getElementById('search-status').textContent = 'SCANNING…';
   try {
     const res = await fetch(`/api/search?collection=${encodeURIComponent(currentCollection)}&q=${encodeURIComponent(q)}&limit=500`);
+    if (!res.ok) {
+      const message = await res.text();
+      throw new Error(message || 'search failed');
+    }
     const data = await res.json();
     buildParticles(data.points || []);
-    document.getElementById('search-status').textContent = `${(data.points||[]).length} HITS`;
+    document.getElementById('search-status').textContent = `${(data.points || []).length} HITS`;
   } catch(e) {
     document.getElementById('search-status').textContent = 'ERROR';
   }
@@ -937,11 +1396,25 @@ async function doSearch() {
 
 // ── Controls wiring ───────────────────────────────────────────────────────────
 function wireControls() {
+  const pointLimitCtrl = document.getElementById('ctrl-point-limit');
+  pointLimitCtrl.addEventListener('input', e => {
+    pointLimit = parseInt(e.target.value, 10);
+    document.getElementById('val-point-limit').textContent = pointLimit.toLocaleString();
+  });
+  pointLimitCtrl.addEventListener('change', () => {
+    loadPoints(currentCollection, pointLimit);
+    document.getElementById('search-status').textContent = '';
+    document.getElementById('search-input').value = '';
+  });
+
   document.getElementById('ctrl-size').addEventListener('input', e => {
     const v = parseFloat(e.target.value);
     pointSize = v;
     document.getElementById('val-size').textContent = v.toFixed(1);
-    if (particleSystem) {
+    if (basePointSizes) basePointSizes.fill(v);
+    if (similarityModeActive) {
+      applySignalScanHighlight();
+    } else if (particleSystem) {
       const sizes = particleSystem.geometry.attributes.size.array;
       sizes.fill(v);
       particleSystem.geometry.attributes.size.needsUpdate = true;
@@ -975,25 +1448,51 @@ function wireControls() {
 
   document.getElementById('ctrl-speed').addEventListener('input', e => {
     const v = parseFloat(e.target.value);
-    document.getElementById('val-speed').textContent = v;
+    document.getElementById('val-speed').textContent = v.toFixed(2);
     rotSpeed = v;
+  });
+
+  document.getElementById('ctrl-hue').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    hueShift = v;
+    document.getElementById('val-hue').textContent = `${Math.round(v)}°`;
+    refreshPointColors();
+  });
+
+  document.getElementById('ctrl-saturation').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    saturationMult = v;
+    document.getElementById('val-saturation').textContent = v.toFixed(2);
+    refreshPointColors();
+  });
+
+  document.getElementById('ctrl-lightness').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    lightnessMult = v;
+    document.getElementById('val-lightness').textContent = v.toFixed(2);
+    refreshPointColors();
   });
 
   document.getElementById('collection-select').addEventListener('change', e => {
     currentCollection = e.target.value;
-    loadPoints(currentCollection);
+    loadPoints(currentCollection, pointLimit);
     document.getElementById('search-status').textContent = '';
     document.getElementById('search-input').value = '';
   });
 
   document.getElementById('btn-reload').addEventListener('click', () => {
-    loadPoints(currentCollection);
+    loadPoints(currentCollection, pointLimit);
   });
+
+  document.getElementById('btn-find-similar').addEventListener('click', runFindSimilar);
+  document.getElementById('btn-clear-scan').addEventListener('click', clearSignalScan);
 
   document.getElementById('btn-search').addEventListener('click', doSearch);
   document.getElementById('search-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') doSearch();
   });
+
+  updateSignalButtons();
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -1002,7 +1501,7 @@ async function main() {
   animate();
   wireControls();
   await loadCollections();
-  await loadPoints(currentCollection);
+  await loadPoints(currentCollection, pointLimit);
 }
 
 main();

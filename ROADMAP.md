@@ -33,6 +33,8 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [ ] **Empty collection handling** — graceful state instead of blank canvas
 - [ ] **Responsive layout** — HUD panels collapse on narrow viewports
 - [ ] **Collection metadata sidebar** — vector size, distance metric, point count
+- [x] **Color grading controls** — hue/saturation/lightness live remap for cluster palette
+- [x] **Point sample slider** — interactive point-count control wired to reload
 - [ ] **Keyboard shortcuts** — `R` reload, `Space` pause rotation, `Esc` clear inspector
 
 ---
@@ -44,13 +46,14 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [ ] **Projection caching** — cache PCA result to disk, serve instantly on reload
 - [ ] **Axis labels** — show what PC1/PC2/PC3 correspond to (variance explained %)
 - [ ] **Projection selector** — UI toggle between PCA / random / t-SNE (server-side)
-- [ ] **Named vector support** — handle Qdrant collections with multiple named vectors
+- [ ] **Advanced named vector support** — explicit vector selection for collections with multiple named vectors (basic first-vector fallback now exists)
 
 ---
 
 ## 🔍 v0.4 — Vector Search
 
 - [ ] **Semantic search** — embed a query string (via Ollama or OpenRouter) and do true nearest-neighbor search against Qdrant
+- [x] **Signal Scanner (top-K neighbors)** — click a point, run nearest-neighbor scan, highlight matches, and inspect ranked results
 - [ ] **Similarity radius** — click a point, highlight all neighbors within cosine distance threshold
 - [ ] **Distance matrix heatmap** — 2D mini-heatmap of inter-cluster distances in the HUD
 - [ ] **Outlier detection** — flag points with low neighbor density (rare finds) in a distinct color
