@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"embed"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -60,7 +62,8 @@ type collectionInfo struct {
 		Config      struct {
 			Params struct {
 				Vectors struct {
-					Size uint64 `json:"size"`
+					Size     uint64 `json:"size"`
+					Distance string `json:"distance"`
 				} `json:"vectors"`
 			} `json:"params"`
 		} `json:"config"`
@@ -87,9 +90,10 @@ type pointsByIDResult struct {
 }
 
 type searchPointsRequest struct {
-	Vector      interface{} `json:"vector"`
-	Limit       int         `json:"limit"`
-	WithPayload bool        `json:"with_payload"`
+	Vector         interface{} `json:"vector"`
+	Limit          int         `json:"limit"`
+	WithPayload    bool        `json:"with_payload"`
+	ScoreThreshold *float64    `json:"score_threshold,omitempty"`
 }
 
 type searchPointHit struct {
@@ -115,11 +119,12 @@ type similarNeighbor struct {
 }
 
 type similarResponse struct {
-	SelectedID interface{}       `json:"selected_id"`
-	Collection string            `json:"collection"`
-	Limit      int               `json:"limit"`
-	VectorName string            `json:"vector_name,omitempty"`
-	Neighbors  []similarNeighbor `json:"neighbors"`
+	SelectedID       interface{}       `json:"selected_id"`
+	Collection       string            `json:"collection"`
+	Limit            int               `json:"limit"`
+	SimilarityRadius *float64          `json:"similarity_radius,omitempty"`
+	VectorName       string            `json:"vector_name,omitempty"`
+	Neighbors        []similarNeighbor `json:"neighbors"`
 }
 
 // ── API response types ────────────────────────────────────────────────────────
@@ -141,9 +146,21 @@ type CollectionMeta struct {
 	Name            string `json:"name"`
 	PointsCount     uint64 `json:"points_count"`
 	VectorSize      uint64 `json:"vector_size"`
+	DistanceMetric  string `json:"distance_metric,omitempty"`
 	ProjectionReady bool   `json:"projection_ready"`
 	ProjectionNote  string `json:"projection_note,omitempty"`
 }
+
+type loadProgress struct {
+	Loaded  int    `json:"loaded"`
+	Limit   int    `json:"limit"`
+	Percent int    `json:"percent"`
+	Status  string `json:"status"`
+	Done    bool   `json:"done"`
+	Error   string `json:"error,omitempty"`
+}
+
+var pointsLoadProgress sync.Map
 
 // ── Qdrant client ─────────────────────────────────────────────────────────────
 
@@ -207,9 +224,10 @@ func (q *qdrantClient) collectionMeta(ctx context.Context, name string) (Collect
 		return CollectionMeta{}, fmt.Errorf("collectionMeta decode: %w", err)
 	}
 	return CollectionMeta{
-		Name:        name,
-		PointsCount: info.Result.PointsCount,
-		VectorSize:  info.Result.Config.Params.Vectors.Size,
+		Name:           name,
+		PointsCount:    info.Result.PointsCount,
+		VectorSize:     info.Result.Config.Params.Vectors.Size,
+		DistanceMetric: info.Result.Config.Params.Vectors.Distance,
 	}, nil
 }
 
@@ -287,10 +305,37 @@ func parseSimilarityLimit(r *http.Request, fallback int) (int, error) {
 			limit = body.Limit
 		}
 	}
-	if limit > 200 {
-		limit = 200
+	if limit > 500 {
+		limit = 500
 	}
 	return limit, nil
+}
+
+func parseSimilarityRadius(r *http.Request, fallback float64) (float64, error) {
+	radius := fallback
+	if raw := strings.TrimSpace(r.URL.Query().Get("radius")); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v < 0 || v > 1 {
+			return 0, fmt.Errorf("invalid radius: %q", raw)
+		}
+		radius = v
+	}
+	if r.Method == http.MethodPost && r.Body != nil {
+		var body struct {
+			Radius *float64 `json:"radius"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			return 0, fmt.Errorf("invalid request body: %w", err)
+		}
+		if body.Radius != nil {
+			v := *body.Radius
+			if v < 0 || v > 1 {
+				return 0, fmt.Errorf("invalid radius: %v", v)
+			}
+			radius = v
+		}
+	}
+	return radius, nil
 }
 
 func canonicalPointID(v interface{}) string {
@@ -375,12 +420,47 @@ func pcaScript() string {
 	return "pca_gpu.py"
 }
 
+func clampPercent(loaded, limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	percent := int(float64(loaded) / float64(limit) * 100.0)
+	if percent < 0 {
+		return 0
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func setLoadProgress(progressID string, progress loadProgress) {
+	if progressID == "" {
+		return
+	}
+	pointsLoadProgress.Store(progressID, progress)
+}
+
+func parseFetchProgressLine(line string) (int, int, bool) {
+	idx := strings.Index(line, "Fetched ")
+	if idx == -1 {
+		return 0, 0, false
+	}
+	segment := line[idx:]
+	var loaded, limit int
+	if _, err := fmt.Sscanf(segment, "Fetched %d / %d", &loaded, &limit); err != nil {
+		return 0, 0, false
+	}
+	return loaded, limit, true
+}
+
 // runGPUPCA calls pca_gpu.py and returns projected PointData
-func runGPUPCA(collection string, limit int, qdrantURL string) ([]PointData, error) {
+func runGPUPCA(collection string, limit int, qdrantURL, progressID string) ([]PointData, error) {
 	py := pythonBin()
 	script := pcaScript()
 
 	log.Printf("GPU PCA: %s %s %s %d %s", py, script, collection, limit, qdrantURL)
+	setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "starting", Done: false})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -390,17 +470,61 @@ func runGPUPCA(collection string, limit int, qdrantURL string) ([]PointData, err
 		strconv.Itoa(limit),
 		qdrantURL,
 	)
-	cmd.Stderr = os.Stderr // stream [pca_gpu] logs to terminal
 
-	out, err := cmd.Output()
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("pca_gpu.py failed: %w", err)
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start pca_gpu.py: %w", err)
+	}
+
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Print(line)
+			if loaded, progressLimit, ok := parseFetchProgressLine(line); ok {
+				setLoadProgress(progressID, loadProgress{
+					Loaded:  loaded,
+					Limit:   progressLimit,
+					Percent: clampPercent(loaded, progressLimit),
+					Status:  "scrolling",
+					Done:    false,
+				})
+				continue
+			}
+			if strings.Contains(line, "Fetch done") {
+				setLoadProgress(progressID, loadProgress{Loaded: limit, Limit: limit, Percent: 100, Status: "projecting", Done: false})
+			}
+		}
+	}()
+
+	out, readErr := io.ReadAll(stdoutPipe)
+	waitErr := cmd.Wait()
+	<-stderrDone
+
+	if readErr != nil {
+		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: readErr.Error()})
+		return nil, fmt.Errorf("read pca_gpu.py output: %w", readErr)
+	}
+	if waitErr != nil {
+		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: waitErr.Error()})
+		return nil, fmt.Errorf("pca_gpu.py failed: %w", waitErr)
 	}
 
 	var resp PointsResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
+		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
 		return nil, fmt.Errorf("pca_gpu.py bad JSON: %w — output: %.300s", err, string(out))
 	}
+	setLoadProgress(progressID, loadProgress{Loaded: len(resp.Points), Limit: limit, Percent: 100, Status: "done", Done: true})
 	return resp.Points, nil
 }
 
@@ -455,6 +579,23 @@ func main() {
 		json.NewEncoder(w).Encode(metas)
 	})
 
+	// GET /api/load-progress?id=progress_id
+	mux.HandleFunc("/api/load-progress", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		if id == "" {
+			http.Error(w, "id is required", http.StatusBadRequest)
+			return
+		}
+		value, ok := pointsLoadProgress.Load(id)
+		if !ok {
+			http.Error(w, "progress id not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(value)
+	})
+
 	// GET /api/points?collection=X&limit=N
 	// Delegates fetch+PCA to pca_gpu.py
 	mux.HandleFunc("/api/points", func(w http.ResponseWriter, r *http.Request) {
@@ -469,10 +610,12 @@ func main() {
 				limit = lv
 			}
 		}
+		progressID := strings.TrimSpace(r.URL.Query().Get("progress_id"))
 
 		log.Printf("→ /api/points collection=%s limit=%d", collection, limit)
-		points, err := runGPUPCA(collection, limit, qdrantURL)
+		points, err := runGPUPCA(collection, limit, qdrantURL, progressID)
 		if err != nil {
+			setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
 			log.Printf("ERROR runGPUPCA: %v", err)
 			http.Error(w, err.Error(), 500)
 			return
@@ -636,6 +779,94 @@ func main() {
 			Limit:      limit,
 			VectorName: vectorName,
 			Neighbors:  neighbors,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// GET|POST /api/collections/{collection}/points/{point_id}/similar-radius?radius=0.92&limit=400
+	mux.HandleFunc("/api/collections/{collection}/points/{point_id}/similar-radius", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		collection := strings.TrimSpace(r.PathValue("collection"))
+		pointID := strings.TrimSpace(r.PathValue("point_id"))
+		if collection == "" || pointID == "" {
+			http.Error(w, "collection and point_id are required", http.StatusBadRequest)
+			return
+		}
+
+		radius, err := parseSimilarityRadius(r, 0.92)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		limit, err := parseSimilarityLimit(r, 400)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		selected, err := q.getPointByID(r.Context(), collection, pointID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if selected == nil {
+			http.Error(w, "selected point not found", http.StatusNotFound)
+			return
+		}
+
+		searchVector, vectorName := pickSearchVector(selected.Vector)
+		if searchVector == nil {
+			http.Error(w, "selected point has no usable vector", http.StatusBadRequest)
+			return
+		}
+
+		sreq := searchPointsRequest{
+			Vector:         searchVector,
+			Limit:          limit + 1,
+			WithPayload:    true,
+			ScoreThreshold: &radius,
+		}
+		raw, status, err := q.do(r.Context(), http.MethodPost,
+			"/collections/"+collection+"/points/search", sreq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if status >= 400 {
+			http.Error(w, fmt.Sprintf("qdrant %d: %s", status, string(raw)), http.StatusInternalServerError)
+			return
+		}
+
+		var searchRes searchPointsResult
+		if err := json.Unmarshal(raw, &searchRes); err != nil {
+			http.Error(w, fmt.Sprintf("decode radius search: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		selectedKey := canonicalPointID(selected.ID)
+		neighbors := make([]similarNeighbor, 0, limit)
+		for _, hit := range searchRes.Result {
+			if canonicalPointID(hit.ID) == selectedKey {
+				continue
+			}
+			neighbors = append(neighbors, similarNeighbor{ID: hit.ID, Score: hit.Score, Payload: hit.Payload})
+			if len(neighbors) >= limit {
+				break
+			}
+		}
+
+		resp := similarResponse{
+			SelectedID:       selected.ID,
+			Collection:       collection,
+			Limit:            limit,
+			SimilarityRadius: &radius,
+			VectorName:       vectorName,
+			Neighbors:        neighbors,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)

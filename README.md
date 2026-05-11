@@ -39,12 +39,16 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Projection auto-selects the dominant dense vector dimension and skips incompatible vectors
 - Color-coded clusters derived from source payload keys (`file_source`, `source_id`, `source_collection`, `source_file`, `source`) with lowercase/UPPERCASE compatibility
 - Exponential fog, starfield background, and a subtle grid anchor the scene in deep space
+- Cluster distance matrix heatmap in the HUD (top clusters by centroid distance)
+- Outlier detection marks sparse low-density points in a distinct color
+- Friendly error overlay when Qdrant is unreachable
 
 **Exploration**
 - Orbit, zoom, and pan with mouse — smooth damped controls
 - View cube overlay in the 3D window mirrors camera orientation, supports one-click axis snapping, and adds clickable corner markers for instant isometric views
 - Click any particle to inspect its full Qdrant payload in the HUD
 - Signal Scanner: run **Find Similar** on the selected point to fetch nearest neighbors from Qdrant
+- Similarity radius scan: run **RADIUS SCAN** to highlight all neighbors above a cosine threshold
 - Similarity highlight mode: selected signal pulses, neighbor signals brighten, unrelated points fade
 - Similar Signals side list with rank, score, snippet, and click-to-focus for loaded points
 - Hover preview — inspector updates as you sweep when no point is pinned
@@ -54,6 +58,10 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 **Controls**
 - Real-time sliders: point count, point size, opacity, bloom strength, auto-rotation speed, hue shift, saturation, lightness
 - Collection picker — shows point count/vector dim, disables non-projectable collections, and switches without restarting
+- Collection metadata panel — collection name, point count, vector size, distance metric, projection status
+- Loading overlay with progress percentage while vectors are fetched and projected
+- Responsive HUD collapse for narrow viewports (mobile/tablet)
+- Keyboard shortcuts: `R` reload, `Space` pause/resume rotation, `Esc` clear inspector selection
 - Reload button — re-pull latest vectors on demand
 
 **Architecture**
@@ -142,7 +150,8 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | View cube face click | Snap camera to ±X / ±Y / ±Z |
 | View cube corner click | Snap camera to diagonal isometric view (±X ±Y ±Z) |
 | Click particle | Pin signal in inspector |
-| FIND SIMILAR | Run nearest-neighbor scan in current collection |
+| FIND SIMILAR | Run top-K nearest-neighbor scan in current collection |
+| RADIUS SCAN | Highlight all neighbors above selected cosine threshold |
 | CLEAR SCAN | Exit highlight mode and restore normal cloud |
 | Point Count slider | Reload cloud with selected sample size |
 | Hue / Saturation / Lightness | Live palette remapping without reloading |
@@ -150,6 +159,7 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | Search + SCAN | Filter to matching points |
 | Collection picker | Switch active collection |
 | ↺ RELOAD | Re-pull vectors from Qdrant |
+| R / Space / Esc | Reload / pause rotation / clear inspector |
 
 ---
 
@@ -171,8 +181,8 @@ Signal Scanner turns the inspector into a neighborhood probe:
 
 1. Load a collection.
 2. Click a point to pin it in **Signal Inspector**.
-3. Press **FIND SIMILAR**.
-4. VectorView fetches nearest neighbors from Qdrant using the selected point's vector.
+3. Press **FIND SIMILAR** for top-K neighbors, or **RADIUS SCAN** for all neighbors above a cosine threshold.
+4. VectorView fetches neighbors from Qdrant using the selected point's vector.
 5. The selected signal pulses, similar signals brighten, and unrelated points dim.
 6. Review neighbors in **Similar Signals**; click one to focus it when present in the loaded sample.
 
@@ -180,7 +190,7 @@ Signal Scanner turns the inspector into a neighborhood probe:
 
 - Endpoint uses the selected point vector directly against `/points/search` in the same collection.
 - If vectors are named, VectorView picks the first detected named vector key from the selected point payload and sends `{name, vector}`.
-- `limit` defaults to `12` and is capped to `200` server-side.
+- `limit` defaults to `12` and is capped to `500` server-side.
 - If neighbors are returned by Qdrant but not present in the currently loaded point sample, they still appear in the Similar Signals list and are marked as outside the visible sample.
 - Current search endpoint remains payload-text search; it does not yet combine keyword scan + nearest-neighbor reranking.
 
@@ -191,11 +201,14 @@ Signal Scanner turns the inspector into a neighborhood probe:
 VectorView exposes a small REST API that the frontend uses — useful for scripting or integration:
 
 ```
-GET  /api/collections                                                → list all Qdrant collections with metadata + projection readiness
-GET  /api/points?collection=X&limit=N                                → full-collection projection via Python PCA worker
-GET  /api/search?collection=X&q=term                                 → payload keyword search + inline Go PCA reprojection (mixed-case payload key support)
-GET  /api/collections/{collection}/points/{point_id}/similar?limit=N → nearest-neighbor scan from selected point vector
-POST /api/collections/{collection}/points/{point_id}/similar         → same as above (JSON body supports {"limit": N})
+GET  /api/collections                                                             → list all Qdrant collections with metadata + projection readiness
+GET  /api/load-progress?id=progress_id                                            → live projection/fetch progress for active /api/points request
+GET  /api/points?collection=X&limit=N&progress_id=token                           → full-collection projection via Python PCA worker
+GET  /api/search?collection=X&q=term                                              → payload keyword search + inline Go PCA reprojection (mixed-case payload key support)
+GET  /api/collections/{collection}/points/{point_id}/similar?limit=N              → nearest-neighbor top-K scan from selected point vector
+POST /api/collections/{collection}/points/{point_id}/similar                      → same as above (JSON body supports {"limit": N})
+GET  /api/collections/{collection}/points/{point_id}/similar-radius?radius=R&limit=N → cosine-threshold neighborhood scan
+POST /api/collections/{collection}/points/{point_id}/similar-radius               → same as above (JSON body supports {"radius": R, "limit": N})
 ```
 
 Example response from `/api/collections`:
@@ -205,6 +218,7 @@ Example response from `/api/collections`:
     "name": "meistro_brain",
     "points_count": 847,
     "vector_size": 768,
+    "distance_metric": "Cosine",
     "projection_ready": true,
     "projection_note": "ok"
   }
@@ -243,6 +257,27 @@ Example response from `/api/collections/{collection}/points/{point_id}/similar`:
         "text": "Example text...",
         "date": "2025-01-17",
         "file_source": "example.json"
+      }
+    }
+  ]
+}
+```
+
+Example response from `/api/collections/{collection}/points/{point_id}/similar-radius`:
+```json
+{
+  "selected_id": "abc123",
+  "collection": "meistro_brain",
+  "limit": 400,
+  "similarity_radius": 0.92,
+  "vector_name": "default",
+  "neighbors": [
+    {
+      "id": "ghi789",
+      "score": 0.934,
+      "payload": {
+        "title": "Nearby signal",
+        "text": "Within cosine threshold..."
       }
     }
   ]

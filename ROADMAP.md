@@ -28,15 +28,15 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [x] **`go.sum` generation** — ensure clean `go mod tidy` on fresh clone
 - [x] **`.gitignore`** — exclude `.env`, binary, `__pycache__`
 - [x] **`.env.example`** — committed template with all vars documented
-- [ ] **Error overlay in UI** — friendly message when Qdrant is unreachable
-- [ ] **Loading progress bar** — show % of points loaded during scroll
+- [x] **Error overlay in UI** — friendly message when Qdrant is unreachable
+- [x] **Loading progress bar** — show % of points loaded during scroll
 - [x] **Empty collection handling** — picker now shows a graceful "No collections available" state
-- [ ] **Responsive layout** — HUD panels collapse on narrow viewports
-- [ ] **Collection metadata sidebar** — vector size, distance metric, point count
+- [x] **Responsive layout** — HUD panels collapse on narrow viewports
+- [x] **Collection metadata sidebar** — vector size, distance metric, point count
 - [x] **Projection readiness in collection picker** — show vector dims and disable unsupported collections
 - [x] **Color grading controls** — hue/saturation/lightness live remap for cluster palette
 - [x] **Point sample slider** — interactive point-count control wired to reload
-- [ ] **Keyboard shortcuts** — `R` reload, `Space` pause rotation, `Esc` clear inspector
+- [x] **Keyboard shortcuts** — `R` reload, `Space` pause rotation, `Esc` clear inspector
 
 ---
 
@@ -55,9 +55,9 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 
 - [ ] **Semantic search** — embed a query string (via Ollama or OpenRouter) and do true nearest-neighbor search against Qdrant
 - [x] **Signal Scanner (top-K neighbors)** — click a point, run nearest-neighbor scan, highlight matches, and inspect ranked results
-- [ ] **Similarity radius** — click a point, highlight all neighbors within cosine distance threshold
-- [ ] **Distance matrix heatmap** — 2D mini-heatmap of inter-cluster distances in the HUD
-- [ ] **Outlier detection** — flag points with low neighbor density (rare finds) in a distinct color
+- [x] **Similarity radius** — click a point, highlight all neighbors within cosine distance threshold
+- [x] **Distance matrix heatmap** — 2D mini-heatmap of inter-cluster distances in the HUD
+- [x] **Outlier detection** — flag points with low neighbor density (rare finds) in a distinct color
 - [ ] **Cross-collection search** — query one collection, highlight matches in another
 
 ---
