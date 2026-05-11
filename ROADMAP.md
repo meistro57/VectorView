@@ -10,7 +10,7 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 
 - [x] Go binary with embedded frontend via `//go:embed`
 - [x] Qdrant paginated scroll — pulls full collections with vectors
-- [x] Hybrid PCA pipeline — Python GPU worker for full collections + inline Go power-iteration PCA for filtered search results
+- [x] Unified projection pipeline — Python worker for full collections and filtered search results with PCA/random/t-SNE modes
 - [x] Three.js r128 particle cloud with custom GLSL shaders
 - [x] Additive blending + dual-layer bloom (core + glow)
 - [x] Pulsing vertex animation driven by `uTime` uniform
@@ -45,8 +45,8 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [ ] **UMAP via subprocess or WASM** — optional upgrade from PCA for non-linear structure
 - [ ] **Incremental projection** — add new points to existing scene without full re-project
 - [ ] **Projection caching** — cache PCA result to disk, serve instantly on reload
-- [ ] **Axis labels** — show what PC1/PC2/PC3 correspond to (variance explained %)
-- [ ] **Projection selector** — UI toggle between PCA / random / t-SNE (server-side)
+- [x] **Axis labels** — show what PC1/PC2/PC3 correspond to (variance explained %)
+- [x] **Projection selector** — UI toggle between PCA / random / t-SNE (server-side)
 - [ ] **Advanced named vector support** — explicit vector selection for collections with multiple named vectors (basic first-vector fallback now exists)
 
 ---

@@ -35,8 +35,8 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 
 **Visualization**
 - Live 3D particle cloud rendered via custom WebGL shaders — additive blending, pulsing glow, dual-layer bloom
-- Hybrid PCA pipeline: `/api/points` uses `pca_gpu.py` (PyTorch/CuPy/NumPy), `/api/search` uses inline Go PCA for smaller result sets
-- Projection auto-selects the dominant dense vector dimension and skips incompatible vectors
+- Unified projection pipeline: both `/api/points` and `/api/search` use `pca_gpu.py` (PyTorch/CuPy/NumPy) with selectable `pca`, `random`, or `tsne` modes
+- Projection auto-selects the dominant dense vector dimension and skips incompatible vectors, then returns per-axis variance metadata for HUD readout
 - Color-coded clusters derived from source payload keys (`file_source`, `source_id`, `source_collection`, `source_file`, `source`) with lowercase/UPPERCASE compatibility
 - Exponential fog, starfield background, and a subtle grid anchor the scene in deep space
 - Cluster distance matrix heatmap in the HUD (top clusters by centroid distance)
@@ -58,7 +58,9 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 **Controls**
 - Real-time sliders: point count, point size, opacity, bloom strength, auto-rotation speed, hue shift, saturation, lightness
 - Collection picker — shows point count/vector dim, disables non-projectable collections, and switches without restarting
+- Projection selector — switch between PCA / random / t-SNE and reload current view with the selected method
 - Collection metadata panel — collection name, point count, vector size, distance metric, projection status
+- Projection axes panel — shows top 3 projection components and variance explained percentages
 - Loading overlay with progress percentage while vectors are fetched and projected
 - Responsive HUD collapse for narrow viewports (mobile/tablet)
 - Keyboard shortcuts: `R` reload, `Space` pause/resume rotation, `Esc` clear inspector selection
@@ -66,7 +68,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 
 **Architecture**
 - Single Go binary with `//go:embed` — ships the entire frontend inside the executable
-- Python PCA worker (`pca_gpu.py`) for full-collection projection with GPU/CPU fallbacks
+- Python projection worker (`pca_gpu.py`) for both full-collection and filtered-result projection with GPU/CPU fallbacks
 - Raw HTTP Qdrant client — no SDK bloat, same pattern as meta_bridge
 - `.env` support via `godotenv` — drop your existing config and go
 
@@ -77,7 +79,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 ### Prerequisites
 
 - [Go 1.22+](https://golang.org/dl/)
-- [Python 3.9+](https://www.python.org/downloads/) with `numpy` installed (`torch`/`cupy` optional for GPU acceleration)
+- [Python 3.9+](https://www.python.org/downloads/) with `numpy` installed (`torch`/`cupy` optional for GPU acceleration, `scikit-learn` optional for t-SNE mode)
 - [Qdrant](https://qdrant.tech) running locally (default: `http://localhost:6333`)
 - A populated collection to explore
 
@@ -88,6 +90,8 @@ git clone https://github.com/meistro57/VectorView.git
 cd VectorView
 go mod tidy
 python3 -m pip install numpy
+# optional: required only for projection=tsne
+python3 -m pip install scikit-learn
 go run .
 ```
 
@@ -165,11 +169,11 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 
 ## 🧠 How the 3D Projection Works
 
-VectorView uses a **hybrid PCA pipeline**:
+VectorView uses a **unified projection pipeline**:
 
-1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, detects the most common dense vector dimension in the sample, keeps vectors matching that dimension, runs PCA through PyTorch/CuPy when available (NumPy randomized SVD fallback), and returns normalized 3D coordinates.
-2. **`/api/search` path (filtered subset):** Go performs inline power-iteration PCA for fast small-result reprojection without spawning Python, using the same dominant-dimension dense-vector selection logic.
-3. **Normalize** — both paths scale coordinates into a ±100 unit cube for comfortable viewing.
+1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, detects the most common dense vector dimension in the sample, keeps vectors matching that dimension, runs the selected projection (`pca`, `random`, or `tsne`), and returns normalized 3D coordinates.
+2. **`/api/search` path (filtered subset):** Go fetches keyword-matched points, then calls the same `pca_gpu.py` worker via stdin with the selected projection method, so behavior matches full-load projection.
+3. **Normalize + metadata** — coordinates are scaled into a ±100 unit cube and responses include projection metadata (`method`, top 3 component labels, variance explained %) for HUD axis readout.
 
 The result: semantically similar points cluster together in 3D space. The geometry you see **is** the structure of your knowledge base.
 
@@ -203,8 +207,8 @@ VectorView exposes a small REST API that the frontend uses — useful for script
 ```
 GET  /api/collections                                                             → list all Qdrant collections with metadata + projection readiness
 GET  /api/load-progress?id=progress_id                                            → live projection/fetch progress for active /api/points request
-GET  /api/points?collection=X&limit=N&progress_id=token                           → full-collection projection via Python PCA worker
-GET  /api/search?collection=X&q=term                                              → payload keyword search + inline Go PCA reprojection (mixed-case payload key support)
+GET  /api/points?collection=X&limit=N&projection=pca|random|tsne&progress_id=token → full-collection projection via Python worker
+GET  /api/search?collection=X&q=term&limit=N&projection=pca|random|tsne           → payload keyword search + Python worker reprojection (mixed-case payload key support)
 GET  /api/collections/{collection}/points/{point_id}/similar?limit=N              → nearest-neighbor top-K scan from selected point vector
 POST /api/collections/{collection}/points/{point_id}/similar                      → same as above (JSON body supports {"limit": N})
 GET  /api/collections/{collection}/points/{point_id}/similar-radius?radius=R&limit=N → cosine-threshold neighborhood scan
@@ -237,7 +241,15 @@ Example response from `/api/points`:
   "points": [
     { "id": 123, "x": 14.2, "y": -7.8, "z": 3.1, "payload": { "entity_type": "chunk", "text": "..." } }
   ],
-  "total": 847
+  "total": 847,
+  "projection": {
+    "method": "pca",
+    "axes": [
+      { "component": "PC1", "variance_explained": 38.4 },
+      { "component": "PC2", "variance_explained": 22.1 },
+      { "component": "PC3", "variance_explained": 14.7 }
+    ]
+  }
 }
 ```
 
@@ -290,8 +302,8 @@ Example response from `/api/collections/{collection}/points/{point_id}/similar-r
 
 ```
 VectorView/
-├── main.go          # Go server — Qdrant client, API handlers, inline search PCA, embed
-├── pca_gpu.py       # Python PCA worker for /api/points (PyTorch/CuPy/NumPy fallback)
+├── main.go          # Go server — Qdrant client, API handlers, projection orchestration, embed
+├── pca_gpu.py       # Python projection worker for /api/points and /api/search (PCA/random/t-SNE)
 ├── static/
 │   └── index.html   # Entire frontend — Three.js, GLSL shaders, HUD
 ├── go.mod

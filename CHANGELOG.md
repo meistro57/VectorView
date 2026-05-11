@@ -16,8 +16,11 @@ All notable changes to this project will be documented in this file.
 - Cosine-threshold similarity radius scanning (`/similar-radius`) with adjustable UI slider and highlighted neighborhood mode.
 - Cluster distance matrix mini-heatmap in HUD based on centroid distances of top visible clusters.
 - Outlier detection pass that flags sparse low-density points in a distinct color and legend entry.
+- Projection axis readout in the HUD showing `PC1/PC2/PC3` variance explained percentages from both `/api/points` and `/api/search` responses.
+- Projection selector with server-side `pca`, `random`, and `tsne` modes wired across both full collection load (`/api/points`) and filtered search projection (`/api/search`).
 
 ### Changed
 - `/api/collections` now includes `distance_metric` metadata when available.
+- `/api/search` projection now runs through the Python projection worker for parity with `/api/points`, using shared `projection` response metadata.
 - Similarity limit cap increased to `500`.
 - README and roadmap updated to reflect newly shipped stability and vector-search features.

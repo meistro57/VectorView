@@ -130,8 +130,19 @@ type similarResponse struct {
 // ── API response types ────────────────────────────────────────────────────────
 
 type PointsResponse struct {
-	Points []PointData `json:"points"`
-	Total  int         `json:"total"`
+	Points     []PointData     `json:"points"`
+	Total      int             `json:"total"`
+	Projection *ProjectionMeta `json:"projection,omitempty"`
+}
+
+type ProjectionMeta struct {
+	Method string           `json:"method"`
+	Axes   []ProjectionAxis `json:"axes"`
+}
+
+type ProjectionAxis struct {
+	Component         string  `json:"component"`
+	VarianceExplained float64 `json:"variance_explained"`
 }
 
 type PointData struct {
@@ -338,6 +349,19 @@ func parseSimilarityRadius(r *http.Request, fallback float64) (float64, error) {
 	return radius, nil
 }
 
+func parseProjectionMethod(raw string) (string, error) {
+	method := strings.ToLower(strings.TrimSpace(raw))
+	if method == "" {
+		method = "pca"
+	}
+	switch method {
+	case "pca", "random", "tsne":
+		return method, nil
+	default:
+		return "", fmt.Errorf("invalid projection: %q (expected pca, random, tsne)", raw)
+	}
+}
+
 func canonicalPointID(v interface{}) string {
 	switch t := v.(type) {
 	case string:
@@ -454,8 +478,8 @@ func parseFetchProgressLine(line string) (int, int, bool) {
 	return loaded, limit, true
 }
 
-// runGPUPCA calls pca_gpu.py and returns projected PointData
-func runGPUPCA(collection string, limit int, qdrantURL, progressID string) ([]PointData, error) {
+// runGPUPCA calls pca_gpu.py and returns projected points response
+func runGPUPCA(collection string, limit int, qdrantURL, projectionMethod, progressID string) (PointsResponse, error) {
 	py := pythonBin()
 	script := pcaScript()
 
@@ -469,18 +493,19 @@ func runGPUPCA(collection string, limit int, qdrantURL, progressID string) ([]Po
 		collection,
 		strconv.Itoa(limit),
 		qdrantURL,
+		projectionMethod,
 	)
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
+		return PointsResponse{}, fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, fmt.Errorf("stderr pipe: %w", err)
+		return PointsResponse{}, fmt.Errorf("stderr pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start pca_gpu.py: %w", err)
+		return PointsResponse{}, fmt.Errorf("start pca_gpu.py: %w", err)
 	}
 
 	stderrDone := make(chan struct{})
@@ -512,20 +537,72 @@ func runGPUPCA(collection string, limit int, qdrantURL, progressID string) ([]Po
 
 	if readErr != nil {
 		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: readErr.Error()})
-		return nil, fmt.Errorf("read pca_gpu.py output: %w", readErr)
+		return PointsResponse{}, fmt.Errorf("read pca_gpu.py output: %w", readErr)
 	}
 	if waitErr != nil {
 		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: waitErr.Error()})
-		return nil, fmt.Errorf("pca_gpu.py failed: %w", waitErr)
+		return PointsResponse{}, fmt.Errorf("pca_gpu.py failed: %w", waitErr)
 	}
 
 	var resp PointsResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
 		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
-		return nil, fmt.Errorf("pca_gpu.py bad JSON: %w — output: %.300s", err, string(out))
+		return PointsResponse{}, fmt.Errorf("pca_gpu.py bad JSON: %w — output: %.300s", err, string(out))
 	}
 	setLoadProgress(progressID, loadProgress{Loaded: len(resp.Points), Limit: limit, Percent: 100, Status: "done", Done: true})
-	return resp.Points, nil
+	return resp, nil
+}
+
+func runProjectionOnPoints(points []QPoint, projectionMethod string) (PointsResponse, error) {
+	py := pythonBin()
+	script := pcaScript()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, py, script, "--stdin", projectionMethod)
+	payload, err := json.Marshal(map[string]interface{}{"points": points})
+	if err != nil {
+		return PointsResponse{}, fmt.Errorf("marshal projection payload: %w", err)
+	}
+	cmd.Stdin = bytes.NewReader(payload)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return PointsResponse{}, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return PointsResponse{}, fmt.Errorf("stderr pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return PointsResponse{}, fmt.Errorf("start projection worker: %w", err)
+	}
+
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			log.Print(scanner.Text())
+		}
+	}()
+
+	out, readErr := io.ReadAll(stdoutPipe)
+	waitErr := cmd.Wait()
+	<-stderrDone
+	if readErr != nil {
+		return PointsResponse{}, fmt.Errorf("read projection output: %w", readErr)
+	}
+	if waitErr != nil {
+		return PointsResponse{}, fmt.Errorf("projection worker failed: %w", waitErr)
+	}
+
+	var resp PointsResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return PointsResponse{}, fmt.Errorf("projection worker bad JSON: %w — output: %.300s", err, string(out))
+	}
+	return resp, nil
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
@@ -611,9 +688,14 @@ func main() {
 			}
 		}
 		progressID := strings.TrimSpace(r.URL.Query().Get("progress_id"))
+		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-		log.Printf("→ /api/points collection=%s limit=%d", collection, limit)
-		points, err := runGPUPCA(collection, limit, qdrantURL, progressID)
+		log.Printf("→ /api/points collection=%s limit=%d projection=%s", collection, limit, projectionMethod)
+		resp, err := runGPUPCA(collection, limit, qdrantURL, projectionMethod, progressID)
 		if err != nil {
 			setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
 			log.Printf("ERROR runGPUPCA: %v", err)
@@ -621,7 +703,6 @@ func main() {
 			return
 		}
 
-		resp := PointsResponse{Points: points, Total: len(points)}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
@@ -638,6 +719,11 @@ func main() {
 		limit := 500
 		if lv, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && lv > 0 {
 			limit = lv
+		}
+		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 
 		type matchValue struct {
@@ -690,14 +776,16 @@ func main() {
 			return
 		}
 
-		// Re-project the filtered points via inline Go PCA
-		// (search results are small enough — no need for GPU subprocess)
 		var pts []QPoint
 		if res.Result != nil {
 			pts = res.Result.Points
 		}
-		projected := goPCA3D(pts)
-		resp := PointsResponse{Points: projected, Total: len(projected)}
+
+		resp, err := runProjectionOnPoints(pts, projectionMethod)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("projection failed: %v", err), http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
@@ -994,7 +1082,22 @@ func chooseProjectionDimension(points []QPoint) int {
 	return bestDim
 }
 
-func goPCA3D(points []QPoint) []PointData {
+func buildPCAProjectionMeta(componentVariances []float64, totalVariance float64) *ProjectionMeta {
+	axes := make([]ProjectionAxis, 0, 3)
+	for i := 0; i < 3; i++ {
+		variancePercent := 0.0
+		if totalVariance > 1e-12 && i < len(componentVariances) {
+			variancePercent = (componentVariances[i] / totalVariance) * 100.0
+		}
+		axes = append(axes, ProjectionAxis{
+			Component:         fmt.Sprintf("PC%d", i+1),
+			VarianceExplained: variancePercent,
+		})
+	}
+	return &ProjectionMeta{Method: "pca", Axes: axes}
+}
+
+func goPCA3D(points []QPoint) ([]PointData, *ProjectionMeta) {
 	type projectedPoint struct {
 		raw    QPoint
 		vector []float64
@@ -1002,7 +1105,7 @@ func goPCA3D(points []QPoint) []PointData {
 
 	selectedDim := chooseProjectionDimension(points)
 	if selectedDim == 0 {
-		return nil
+		return nil, nil
 	}
 
 	valid := make([]projectedPoint, 0, len(points))
@@ -1016,7 +1119,7 @@ func goPCA3D(points []QPoint) []PointData {
 
 	n := len(valid)
 	if n == 0 {
-		return nil
+		return nil, nil
 	}
 	dim := selectedDim
 
@@ -1050,6 +1153,28 @@ func goPCA3D(points []QPoint) []PointData {
 		}
 	}
 
+	totalVariance := 0.0
+	if n > 1 {
+		for _, row := range centered {
+			for _, v := range row {
+				totalVariance += v * v
+			}
+		}
+		totalVariance /= float64(n - 1)
+	}
+	componentVariances := make([]float64, 3)
+	if n > 1 {
+		for axis := 0; axis < 3; axis++ {
+			sumSq := 0.0
+			for i := 0; i < n; i++ {
+				value := coords[i][axis]
+				sumSq += value * value
+			}
+			componentVariances[axis] = sumSq / float64(n-1)
+		}
+	}
+	projectionMeta := buildPCAProjectionMeta(componentVariances, totalVariance)
+
 	for axis := 0; axis < 3; axis++ {
 		mn, mx := coords[0][axis], coords[0][axis]
 		for i := 1; i < n; i++ {
@@ -1080,7 +1205,7 @@ func goPCA3D(points []QPoint) []PointData {
 			Payload: p.raw.Payload,
 		}
 	}
-	return out
+	return out, projectionMeta
 }
 
 func powerIteration(data [][]float64, n, dim, k, iters int) [][]float64 {

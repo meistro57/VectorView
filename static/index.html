@@ -103,6 +103,18 @@
     border-radius: 2px;
   }
 
+  #ctrl-projection {
+    width: 100%;
+    background: #0a1020;
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    padding: 4px 8px;
+    outline: none;
+    border-radius: 2px;
+  }
+
   #btn-reload {
     background: transparent;
     border: 1px solid var(--neon-g);
@@ -202,6 +214,13 @@
     font-size: 0.58rem;
     line-height: 1.4;
     min-height: 30px;
+    word-break: break-word;
+  }
+
+  #projection-axes {
+    color: var(--text);
+    font-size: 0.64rem;
+    line-height: 1.6;
     word-break: break-word;
   }
 
@@ -718,6 +737,15 @@
   </div>
 
   <div class="ctrl-row">
+    <label>Projection</label>
+    <select id="ctrl-projection">
+      <option value="pca" selected>PCA</option>
+      <option value="random">Random</option>
+      <option value="tsne">t-SNE</option>
+    </select>
+  </div>
+
+  <div class="ctrl-row">
     <label>Point Size <span id="val-size">6.0</span></label>
     <input type="range" id="ctrl-size" min="1" max="12" step="0.1" value="6.0">
   </div>
@@ -768,6 +796,9 @@
     <div class="meta-item"><div class="meta-key">Distance</div><div class="meta-val" id="meta-distance">—</div></div>
     <div class="meta-item"><div class="meta-key">Projection</div><div class="meta-val" id="meta-projection">—</div></div>
   </div>
+
+  <div class="panel-title">⬡ Projection Axes</div>
+  <div id="projection-axes">Load a projection to see axis variance summary.</div>
 
   <div class="panel-title">⬡ Cluster Distance Matrix</div>
   <div id="distance-heatmap-wrap">
@@ -949,6 +980,7 @@ let glowSystem = null;
 let nebulaSystem = null;
 let allPoints = [];
 let currentCollection = 'meistro_brain';
+let projectionMethod = 'pca';
 let pointLimit = 2000;
 let pointSize = 6.0;
 let coreOpacity = 0.85;
@@ -976,6 +1008,7 @@ let scanNeighborIDs = new Set();
 let scanResults = [];
 let loadProgressPollTimer = null;
 let currentLoadProgressID = '';
+let currentProjectionMeta = null;
 const raycaster = new THREE.Raycaster();
 raycaster.params.Points.threshold = 3.0;
 const mouse = new THREE.Vector2(-9999, -9999);
@@ -1399,7 +1432,7 @@ function extractClusterKey(point) {
   return prefix || source || 'unknown';
 }
 
-function buildParticles(points) {
+function buildParticles(points, projectionMeta = null) {
   if (particleSystem) { scene.remove(particleSystem); particleSystem.material.dispose(); }
   if (hazeSystem)     { scene.remove(hazeSystem);     hazeSystem.material.dispose(); }
   if (glowSystem)     { scene.remove(glowSystem);     glowSystem.material.dispose(); }
@@ -1620,6 +1653,8 @@ function buildParticles(points) {
   document.getElementById('stat-collection').textContent = currentCollection;
 
   allPoints = points;
+  currentProjectionMeta = projectionMeta;
+  updateProjectionAxes(currentProjectionMeta);
   basePointColors = new Float32Array(colors);
   basePointSizes = new Float32Array(sizes);
   selectedPoint = null;
@@ -1799,6 +1834,25 @@ function updateCollectionMetaPanel(collectionName) {
   }
   const note = meta.projection_note ? ` · ${meta.projection_note}` : '';
   document.getElementById('meta-projection').textContent = `${meta.projection_ready === false ? 'unsupported' : 'ready'}${note}`;
+}
+
+function updateProjectionAxes(meta) {
+  const el = document.getElementById('projection-axes');
+  if (!el) return;
+
+  if (!meta || !Array.isArray(meta.axes) || meta.axes.length === 0) {
+    el.textContent = 'Load a projection to see axis variance summary.';
+    return;
+  }
+
+  const labels = meta.axes.slice(0, 3).map((axis, idx) => {
+    const component = axis && axis.component ? axis.component : `PC${idx + 1}`;
+    const variance = Number(axis?.variance_explained);
+    const percent = Number.isFinite(variance) ? variance : 0;
+    return `${component} ${percent.toFixed(1)}%`;
+  });
+
+  el.textContent = labels.join(' · ');
 }
 
 // ── Inspector ─────────────────────────────────────────────────────────────────
@@ -2369,7 +2423,7 @@ async function loadPoints(collection, limit = pointLimit) {
   const progressID = `lp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   startLoadProgressPolling(progressID, collection);
   try {
-    const res = await fetch(`/api/points?collection=${encodeURIComponent(collection)}&limit=${limit}&progress_id=${encodeURIComponent(progressID)}`);
+    const res = await fetch(`/api/points?collection=${encodeURIComponent(collection)}&limit=${limit}&projection=${encodeURIComponent(projectionMethod)}&progress_id=${encodeURIComponent(progressID)}`);
     if (!res.ok) {
       const message = await res.text();
       throw new Error(message || 'failed to load points');
@@ -2377,7 +2431,7 @@ async function loadPoints(collection, limit = pointLimit) {
     const data = await res.json();
     stopLoadProgressPolling();
     document.getElementById('loading-sub').textContent = 'RENDERING PARTICLE CLOUD…';
-    buildParticles(data.points || []);
+    buildParticles(data.points || [], data.projection || null);
     hideErrorOverlay();
   } catch(e) {
     stopLoadProgressPolling();
@@ -2397,13 +2451,13 @@ async function doSearch() {
   }
   document.getElementById('search-status').textContent = 'SCANNING…';
   try {
-    const res = await fetch(`/api/search?collection=${encodeURIComponent(currentCollection)}&q=${encodeURIComponent(q)}&limit=500`);
+    const res = await fetch(`/api/search?collection=${encodeURIComponent(currentCollection)}&q=${encodeURIComponent(q)}&limit=500&projection=${encodeURIComponent(projectionMethod)}`);
     if (!res.ok) {
       const message = await res.text();
       throw new Error(message || 'search failed');
     }
     const data = await res.json();
-    buildParticles(data.points || []);
+    buildParticles(data.points || [], data.projection || null);
     document.getElementById('search-status').textContent = `${(data.points || []).length} HITS`;
   } catch(e) {
     maybeShowQdrantError('Search failed', e);
@@ -2419,6 +2473,13 @@ function wireControls() {
     document.getElementById('val-point-limit').textContent = pointLimit.toLocaleString();
   });
   pointLimitCtrl.addEventListener('change', () => {
+    loadPoints(currentCollection, pointLimit);
+    document.getElementById('search-status').textContent = '';
+    document.getElementById('search-input').value = '';
+  });
+
+  document.getElementById('ctrl-projection').addEventListener('change', e => {
+    projectionMethod = e.target.value;
     loadPoints(currentCollection, pointLimit);
     document.getElementById('search-status').textContent = '';
     document.getElementById('search-input').value = '';
