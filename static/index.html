@@ -1090,6 +1090,8 @@ let scanResults = [];
 let loadProgressPollTimer = null;
 let currentLoadProgressID = '';
 let currentProjectionMeta = null;
+let highlightPollTimer = null;
+let lastHighlightEventID = '';
 const raycaster = new THREE.Raycaster();
 raycaster.params.Points.threshold = 3.0;
 const mouse = new THREE.Vector2(-9999, -9999);
@@ -2807,6 +2809,81 @@ async function runSimilarityRadius() {
   updateSignalButtons();
 }
 
+function applyExternalHighlight(event) {
+  const rawIDs = Array.isArray(event?.ids) ? event.ids : [];
+  const ids = [];
+  const seen = new Set();
+  for (const rawID of rawIDs) {
+    const key = pointIDKey(rawID);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    ids.push(key);
+  }
+  if (ids.length === 0) {
+    clearSignalScan();
+    setScanStatus('External highlight cleared.', 'muted');
+    return;
+  }
+
+  const focusKey = pointIDKey(event?.focus_id) || ids[0];
+  const focusIndex = pointIndexByID.get(focusKey);
+  if (Number.isInteger(focusIndex) && focusIndex >= 0 && focusIndex < allPoints.length) {
+    selectPointByIndex(focusIndex);
+  }
+
+  similarityModeActive = true;
+  hoveredSimilarPointID = '';
+  poppedSimilarPointID = '';
+  scanNeighborIDs = new Set(ids);
+  scanResults = ids.map((idKey) => {
+    const idx = pointIndexByID.get(idKey);
+    if (Number.isInteger(idx) && idx >= 0 && idx < allPoints.length) {
+      const point = allPoints[idx];
+      return { id: point.id, score: 1, payload: point.payload || {} };
+    }
+    return { id: idKey, score: 1, payload: {} };
+  });
+
+  applySignalScanHighlight();
+  renderSimilarSignals(scanResults);
+
+  let visibleHits = 0;
+  for (const idKey of ids) {
+    if (pointIndexByID.has(idKey)) visibleHits++;
+  }
+  const offscreen = ids.length - visibleHits;
+  const note = offscreen > 0 ? ` · ${offscreen} outside visible sample` : '';
+  setScanStatus(`External highlight: ${ids.length} signals · ${visibleHits} highlighted${note}`, 'ok');
+  updateSignalButtons();
+}
+
+async function pollExternalHighlight() {
+  if (!currentCollection) return;
+  const sinceQuery = lastHighlightEventID ? `&since=${encodeURIComponent(lastHighlightEventID)}` : '';
+  try {
+    const res = await fetch(`/api/highlight?collection=${encodeURIComponent(currentCollection)}${sinceQuery}`);
+    if (res.status === 204) return;
+    if (!res.ok) {
+      const message = await res.text();
+      throw new Error(message || 'highlight poll failed');
+    }
+    const event = await res.json();
+    const eventID = String(event?.event_id || '').trim();
+    if (!eventID || eventID === lastHighlightEventID) return;
+    lastHighlightEventID = eventID;
+    applyExternalHighlight(event);
+  } catch {
+  }
+}
+
+function startHighlightPolling() {
+  if (highlightPollTimer) {
+    clearInterval(highlightPollTimer);
+  }
+  pollExternalHighlight();
+  highlightPollTimer = setInterval(pollExternalHighlight, 1500);
+}
+
 // ── Raycasting hover ──────────────────────────────────────────────────────────
 let lastHoverIdx = -1;
 function checkHover() {
@@ -2991,6 +3068,8 @@ async function loadPoints(collection, limit = pointLimit) {
       buildParticles(incoming, data.projection || null);
     }
 
+    lastHighlightEventID = '';
+    pollExternalHighlight();
     hideErrorOverlay();
   } catch(e) {
     stopLoadProgressPolling();
@@ -3153,6 +3232,7 @@ function wireControls() {
 
   document.getElementById('collection-select').addEventListener('change', e => {
     currentCollection = e.target.value;
+    lastHighlightEventID = '';
     updateCollectionMetaPanel(currentCollection);
     loadPoints(currentCollection, pointLimit);
     document.getElementById('search-status').textContent = '';
@@ -3210,6 +3290,7 @@ async function main() {
   initScene();
   animate();
   wireControls();
+  startHighlightPolling();
   await loadCollections();
   await loadPoints(currentCollection, pointLimit);
 }

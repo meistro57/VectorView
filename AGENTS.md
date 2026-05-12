@@ -3,9 +3,12 @@
 ## Repository Reality Check
 - This repo is a small single-binary Go app with one Python helper and one embedded frontend file.
 - No existing agent/rule files were found (`.cursor/rules`, `.cursorrules`, `.github/copilot-instructions.md`, `claude.md`, `agents.md`).
-- No test files (`*_test.go`) or CI workflow files were found.
+- No Go unit test files (`*_test.go`) are currently present; CI exists at `.github/workflows/test.yml` and runs `go test ./...`.
 
 ## Essential Commands
+
+## Operator Preferences
+- If the user says "update docs and push", treat it as: update docs + commit + push.
 
 ### Run / Build / Dependency Maintenance
 - `make run` → runs `go run .`
@@ -50,6 +53,7 @@
    - `GET /api/points?collection=&limit=&projection=&vector_name=&append_from=`
    - `GET /api/search?collection=&q=&limit=&projection=&vector_name=`
    - `GET /api/semantic-search?collection=&target_collection=&q=&limit=&projection=&vector_name=`
+   - `GET /api/highlight?collection=&since=` (poll for external highlight triggers)
 3. Backend talks to Qdrant using raw HTTP (`/collections`, `/collections/{name}`, `/collections/{name}/points/scroll`, `/collections/{name}/points/search`).
 
 ### Projection paths (important)
@@ -69,6 +73,7 @@
 - Handlers call `setCORS(w)` and generally write JSON directly with `json.NewEncoder`.
 - Keyword search uses Qdrant `scroll` + `filter.should` over multiple payload keys and case variants.
 - Semantic search embeds query text via Ollama and runs Qdrant nearest-neighbor search.
+- `/api/highlight` (`POST`) stores in-memory highlight events (`ids`, optional `focus_id`) per collection for UI polling.
 - `/api/collections` includes projection status fields (`projection_ready`, `projection_note`) by probing sample vectors.
 - Frontend clustering color key is derived from `payload.file_source` prefix (`extractClusterKey`), not from `entity_type`.
 
@@ -93,5 +98,6 @@
 - `main.go` — server + API + inline PCA + embed
 - `pca_gpu.py` — full-collection PCA worker
 - `static/index.html` — all UI/rendering logic
+- `.github/workflows/test.yml` — CI test workflow (`go test ./...`)
 - `Makefile` — canonical developer shortcuts
 - `.env.example` — runtime configuration template

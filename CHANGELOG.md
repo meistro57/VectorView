@@ -18,7 +18,11 @@ All notable changes to this project will be documented in this file.
 - Timeline reveal controls (manual scrub + autoplay) based on ingestion/timestamp ordering.
 - Screenshot export button for PNG snapshots.
 - Full theme switcher (Deep Space, Bioluminescent, Amber Archaeology, Terminal Green).
+- REST highlight trigger endpoint (`POST /api/highlight`) plus polling endpoint (`GET /api/highlight`) to drive UI highlighting from external tools.
+- GitHub Actions workflow (`.github/workflows/test.yml`) to run `go test ./...` on push and pull request.
 
 ### Changed
 - Random projection normalization adjusted to stabilize incremental append behavior.
-- README, ROADMAP, `.env.example`, and AGENTS documentation updated for projection, caching, semantic, and visual depth features.
+- Similarity point-ID lookup now retries string/int64/uint64 forms to avoid Qdrant ID format mismatches on find-similar flows.
+- Frontend now polls external highlight events and applies them to selection/highlight state in the Signal Scanner.
+- README, ROADMAP, `.env.example`, and AGENTS documentation updated for projection, caching, semantic, visual depth, API highlight triggers, and test requirements.

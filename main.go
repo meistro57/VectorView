@@ -129,6 +129,20 @@ type similarResponse struct {
 	Neighbors        []similarNeighbor `json:"neighbors"`
 }
 
+type highlightRequest struct {
+	Collection string        `json:"collection"`
+	IDs        []interface{} `json:"ids"`
+	FocusID    interface{}   `json:"focus_id,omitempty"`
+}
+
+type highlightEvent struct {
+	EventID    string        `json:"event_id"`
+	Collection string        `json:"collection"`
+	IDs        []interface{} `json:"ids"`
+	FocusID    interface{}   `json:"focus_id,omitempty"`
+	CreatedAt  int64         `json:"created_at"`
+}
+
 // ── API response types ────────────────────────────────────────────────────────
 
 type PointsResponse struct {
@@ -177,6 +191,7 @@ type loadProgress struct {
 }
 
 var pointsLoadProgress sync.Map
+var highlightEvents sync.Map
 
 type projectionCache interface {
 	Get(ctx context.Context, key string) (*PointsResponse, bool, error)
@@ -348,7 +363,12 @@ func (q *qdrantClient) getPointByID(ctx context.Context, collection, pointID str
 	if n, err := strconv.ParseInt(pointID, 10, 64); err == nil {
 		idCandidates = append(idCandidates, n)
 	}
+	if n, err := strconv.ParseUint(pointID, 10, 64); err == nil {
+		idCandidates = append(idCandidates, n)
+	}
 
+	var lastErr error
+	hadSuccessfulLookup := false
 	for _, idCandidate := range idCandidates {
 		req := pointsByIDRequest{
 			IDs:         []interface{}{idCandidate},
@@ -357,20 +377,30 @@ func (q *qdrantClient) getPointByID(ctx context.Context, collection, pointID str
 		}
 		raw, status, err := q.do(ctx, http.MethodPost, "/collections/"+collection+"/points", req)
 		if err != nil {
-			return nil, err
+			lastErr = err
+			continue
 		}
 		if status >= 400 {
-			return nil, fmt.Errorf("qdrant %d: %s", status, string(raw))
+			lastErr = fmt.Errorf("qdrant %d: %s", status, string(raw))
+			continue
 		}
+		hadSuccessfulLookup = true
 		var res pointsByIDResult
 		if err := json.Unmarshal(raw, &res); err != nil {
-			return nil, fmt.Errorf("decode point lookup: %w", err)
+			lastErr = fmt.Errorf("decode point lookup: %w", err)
+			continue
 		}
 		if len(res.Result) > 0 {
 			return &res.Result[0], nil
 		}
 	}
 
+	if hadSuccessfulLookup {
+		return nil, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
 	return nil, nil
 }
 
@@ -907,6 +937,70 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(value)
+	})
+
+	mux.HandleFunc("/api/highlight", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		switch r.Method {
+		case http.MethodPost:
+			var req highlightRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+				return
+			}
+			collection := strings.TrimSpace(req.Collection)
+			if collection == "" {
+				collection = "meistro_brain"
+			}
+			ids := make([]interface{}, 0, len(req.IDs))
+			for _, id := range req.IDs {
+				if canonicalPointID(id) == "" {
+					continue
+				}
+				ids = append(ids, id)
+			}
+			if len(ids) == 0 {
+				http.Error(w, "ids must include at least one point id", http.StatusBadRequest)
+				return
+			}
+			event := highlightEvent{
+				EventID:    strconv.FormatInt(time.Now().UnixNano(), 10),
+				Collection: collection,
+				IDs:        ids,
+				FocusID:    req.FocusID,
+				CreatedAt:  time.Now().UnixMilli(),
+			}
+			if canonicalPointID(event.FocusID) == "" {
+				event.FocusID = ids[0]
+			}
+			highlightEvents.Store(collection, event)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(event)
+		case http.MethodGet:
+			collection := strings.TrimSpace(r.URL.Query().Get("collection"))
+			if collection == "" {
+				collection = "meistro_brain"
+			}
+			since := strings.TrimSpace(r.URL.Query().Get("since"))
+			value, ok := highlightEvents.Load(collection)
+			if !ok {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			event, ok := value.(highlightEvent)
+			if !ok {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			if since != "" && since == event.EventID {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(event)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 
 	// GET /api/points?collection=X&limit=N

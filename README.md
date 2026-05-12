@@ -54,6 +54,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Signal Scanner: run **Find Similar** on the selected point to fetch nearest neighbors from Qdrant
 - Similarity radius scan: run **RADIUS SCAN** to highlight all neighbors above a cosine threshold
 - Similarity highlight mode: selected signal pulses, neighbor signals brighten, unrelated points fade
+- External highlight trigger support via `/api/highlight` for programmatic scanner overlays from other tools
 - Similar Signals side list with rank, score, snippet, and click-to-focus for loaded points
 - Hover preview — inspector updates as you sweep when no point is pinned
 - Payload text search — keyword scan returns a filtered sub-cloud, re-projected live
@@ -79,6 +80,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Python projection worker (`pca_gpu.py`) for both full-collection and filtered-result projection with GPU/CPU fallbacks
 - Raw HTTP Qdrant client — no SDK bloat, same pattern as meta_bridge
 - `.env` support via `godotenv` — drop your existing config and go
+- GitHub Actions CI workflow runs `go test ./...` on pushes to `main` and on pull requests
 
 ---
 
@@ -112,6 +114,16 @@ Open your browser at **[http://localhost:7433](http://localhost:7433)**
 ```bash
 go build -o vectorview .
 ./vectorview
+```
+
+### Test requirements
+
+- Go 1.22+
+- Python 3.9+ with `numpy` available (needed by projection paths that are compiled into test-time build checks)
+- No live Qdrant dependency is required for `go test ./...` right now
+
+```bash
+go test ./...
 ```
 
 ---
@@ -238,6 +250,8 @@ GET  /api/collections/{collection}/points/{point_id}/similar?limit=N            
 POST /api/collections/{collection}/points/{point_id}/similar                      → same as above (JSON body supports {"limit": N})
 GET  /api/collections/{collection}/points/{point_id}/similar-radius?radius=R&limit=N → cosine-threshold neighborhood scan
 POST /api/collections/{collection}/points/{point_id}/similar-radius               → same as above (JSON body supports {"radius": R, "limit": N})
+POST /api/highlight                                                                 → publish external highlight event ({"collection":"X","ids":[...],"focus_id":"..."})
+GET  /api/highlight?collection=X&since=event_id                                     → poll latest external highlight event (204 when unchanged)
 ```
 
 Example response from `/api/collections`:
@@ -333,6 +347,9 @@ VectorView/
 │   └── index.html   # Entire frontend — Three.js, GLSL shaders, HUD
 ├── go.mod
 ├── go.sum
+├── .github/
+│   └── workflows/
+│       └── test.yml # CI: run go test ./... on push/PR
 ├── .env             # Local config (gitignored)
 ├── .env.example     # Config template
 ├── Makefile         # make run / make build

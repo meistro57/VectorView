@@ -90,7 +90,7 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [ ] **KAE integration** — KAE run seeds appear as animated "dig" events in the scene
 - [ ] **Reflect loop overlay** — meta_bridge `reflect.py` claims appear as a separate layer, color-coded by confidence
 - [ ] **Vectoreologist handoff** — click a cluster in VectorView, launch Vectoreologist TUI focused on that region
-- [ ] **REST trigger API** — `POST /api/highlight` to programmatically highlight point IDs from external tools
+- [x] **REST trigger API** — `POST /api/highlight` to programmatically highlight point IDs from external tools
 
 ---
 
