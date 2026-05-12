@@ -8,7 +8,6 @@
   ╚████╔╝ ███████╗╚██████╗   ██║   ╚██████╔╝██║  ██║     ╚████╔╝ ██║███████╗╚███╔███╔╝
    ╚═══╝  ╚══════╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝      ╚═══╝  ╚═╝╚══════╝ ╚══╝╚══╝
 ```
-<img width="420" height="465" alt="image" src="https://github.com/user-attachments/assets/c4be347a-75ca-447b-a112-f3aa664b3a53" />
 
 **Navigate the latent space. See what you know.**
 
@@ -20,10 +19,11 @@
 
 </div>
 
----
+<img width="420" height="465" alt="image" src="https://github.com/user-attachments/assets/c4be347a-75ca-447b-a112-f3aa664b3a53" />
+
 <img width="1882" height="1683" alt="image" src="https://github.com/user-attachments/assets/aa76ef8a-c5ac-4fb6-ba6e-cbd702cbe781" />
 
-
+---
 
 VectorView is a **Go-first local app** that turns your [Qdrant](https://qdrant.tech) vector collections into a live, interactive **3D particle universe** — rendered in the browser with Three.js and a custom GLSL shader engine. The server is a single Go binary with an optional Python PCA worker for fast large-collection projection. No Node.js build step. No config hell. One command, one port, instant visualization.
 
