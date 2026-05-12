@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 - Cluster convex hull overlays for dominant visible clusters (translucent fill + wireframe).
 - Density-aware fog adjustment per loaded cloud.
 - Payload-field point sizing modes (`score`, `confidence`, `chunk_length`, `text_length`).
+- Top HUD load-state indicator (`FETCH`, `PROJECTING`, `RENDERING`, `READY`, `ERROR`) during `/api/points` loads.
 - Timeline reveal controls (manual scrub + autoplay) based on ingestion/timestamp ordering.
 - Screenshot export button for PNG snapshots.
 - Full theme switcher (Deep Space, Bioluminescent, Amber Archaeology, Terminal Green).
@@ -25,4 +26,7 @@ All notable changes to this project will be documented in this file.
 - Random projection normalization adjusted to stabilize incremental append behavior.
 - Similarity point-ID lookup now retries string/int64/uint64 forms to avoid Qdrant ID format mismatches on find-similar flows.
 - Frontend now polls external highlight events and applies them to selection/highlight state in the Signal Scanner.
+- Live ingest now appends new points in-place for random projection mode (with full-sync fallback for non-random projections).
+- Size-field payload lookup now resolves nested payload keys (for example nested `score` or `confidence` metadata).
+- Point Count slider upper bound increased from 20,000 to 75,000.
 - README, ROADMAP, `.env.example`, and AGENTS documentation updated for projection, caching, semantic, visual depth, API highlight triggers, and test requirements.

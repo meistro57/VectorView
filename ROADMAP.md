@@ -29,7 +29,7 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [x] **`.gitignore`** — exclude `.env`, binary, `__pycache__`
 - [x] **`.env.example`** — committed template with all vars documented
 - [x] **Error overlay in UI** — friendly message when Qdrant is unreachable
-- [x] **Loading progress bar** — show % of points loaded during scroll
+- [x] **Loading progress + HUD load state** — show fetch/projection/render status in overlay and top HUD
 - [x] **Empty collection handling** — picker now shows a graceful "No collections available" state
 - [x] **Responsive layout** — HUD panels collapse on narrow viewports
 - [x] **Collection metadata sidebar** — vector size, distance metric, point count
@@ -67,7 +67,7 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [x] **Particle trails** — ghost trail behind auto-rotating camera, stored in off-screen texture
 - [x] **Cluster convex hulls** — translucent mesh wrapping each color cluster
 - [x] **Density fog** — thicker fog in low-density regions, clearing near clusters
-- [x] **Point size by payload field** — e.g. size by `score`, `confidence`, or chunk length
+- [x] **Point size by payload field** — e.g. size by `score`, `confidence`, or chunk length (including nested payload metadata keys)
 - [x] **Time axis** — animate points appearing in ingestion order (timeline scrubber)
 - [x] **Screenshot export** — capture current view as PNG from HUD button
 - [x] **Theme switcher** — deep space (default), bioluminescent, amber archaeology, terminal green
@@ -77,7 +77,7 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 ## ⚡ v0.6 — Live Streaming
 
 - [x] **SSE push endpoint** — `/api/stream` pushes new points as they're ingested
-- [x] **Live ingest mode** — frontend subscribes to SSE, animates new points dropping into the cloud
+- [x] **Live ingest mode** — frontend subscribes to SSE, animates new points dropping into the cloud, and appends new random-projection points in-place
 - [x] **meta_bridge integration** — VectorView watches `mb_chunks` / `mb_claims` collections live during an ingest run
 - [x] **Redis Pub/Sub bridge** — optional Redis subscriber that forwards bot telemetry into the 3D scene
 - [x] **WebSocket ping** — heartbeat keeps connection alive across long ingest sessions

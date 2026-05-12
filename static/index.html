@@ -732,6 +732,7 @@
   <div class="hud-stat"><span>COLLECTION</span><strong id="stat-collection">—</strong></div>
   <div class="hud-stat"><span>POINTS</span><strong id="stat-points">—</strong></div>
   <div class="hud-stat"><span>VISIBLE</span><strong id="stat-visible">—</strong></div>
+  <div class="hud-stat"><span>LOAD</span><strong id="stat-load">READY</strong></div>
   <div class="hud-stat"><span>FPS</span><strong id="stat-fps">—</strong></div>
   <select id="collection-select"></select>
   <button id="btn-snapshot">📸 SNAPSHOT</button>
@@ -744,7 +745,7 @@
 
   <div class="ctrl-row">
     <label>Point Count <span id="val-point-limit">2000</span></label>
-    <input type="range" id="ctrl-point-limit" min="500" max="20000" step="500" value="2000">
+    <input type="range" id="ctrl-point-limit" min="500" max="75000" step="500" value="2000">
   </div>
 
   <div class="ctrl-row">
@@ -1102,6 +1103,7 @@ let liveIngestSource = null;
 let liveIngestSocket = null;
 let liveIngestReloadTimer = null;
 let liveIngestPendingEvents = 0;
+let liveIngestSyncInFlight = false;
 let liveDropSystem = null;
 const liveDropMax = 320;
 const liveDropLife = 3.2;
@@ -1269,12 +1271,35 @@ function hasPayloadValue(value) {
 
 function payloadLookup(payload, ...keys) {
   if (!payload || typeof payload !== 'object') return undefined;
+
+  const variants = new Set();
   for (const key of keys) {
-    for (const variant of [key, key.toLowerCase(), key.toUpperCase()]) {
-      const value = payload[variant];
-      if (hasPayloadValue(value)) return value;
+    variants.add(key);
+    variants.add(String(key).toLowerCase());
+    variants.add(String(key).toUpperCase());
+  }
+
+  for (const variant of variants) {
+    const value = payload[variant];
+    if (hasPayloadValue(value)) return value;
+  }
+
+  const queue = [payload];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const obj = queue.shift();
+    if (!obj || typeof obj !== 'object') continue;
+    if (seen.has(obj)) continue;
+    seen.add(obj);
+
+    for (const [k, v] of Object.entries(obj)) {
+      if (variants.has(k) && hasPayloadValue(v)) return v;
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        queue.push(v);
+      }
     }
   }
+
   return undefined;
 }
 
@@ -1817,18 +1842,61 @@ function stopLiveIngestConnection() {
     liveIngestReloadTimer = null;
   }
   liveIngestPendingEvents = 0;
+  liveIngestSyncInFlight = false;
+}
+
+async function syncLiveIngestPoints() {
+  if (liveIngestSyncInFlight) return;
+  if (!liveIngestEnabled) return;
+  liveIngestSyncInFlight = true;
+  try {
+    const pending = liveIngestPendingEvents;
+    liveIngestPendingEvents = 0;
+    if (pending <= 0) return;
+
+    if (projectionMethod !== 'random') {
+      await loadPoints(currentCollection, pointLimit);
+      setScanStatus(`Live ingest synced ${pending} new signals.`, 'ok');
+      return;
+    }
+
+    const appendFrom = allPoints.length;
+    const nextLimit = Math.min(pointLimit, appendFrom + pending);
+    if (nextLimit <= appendFrom) {
+      setScanStatus('Live ingest received new points. Increase Point Count to display them.', 'muted');
+      return;
+    }
+
+    const vectorQuery = selectedVectorName ? `&vector_name=${encodeURIComponent(selectedVectorName)}` : '';
+    const res = await fetch(`/api/points?collection=${encodeURIComponent(currentCollection)}&limit=${nextLimit}&projection=${encodeURIComponent(projectionMethod)}${vectorQuery}&append_from=${appendFrom}`);
+    if (!res.ok) {
+      const message = await res.text();
+      throw new Error(message || 'incremental live sync failed');
+    }
+    const data = await res.json();
+    const incoming = Array.isArray(data.points) ? data.points : [];
+    if (data.incremental) {
+      buildParticles(allPoints.concat(incoming), data.projection || currentProjectionMeta || null);
+      setScanStatus(`Live ingest appended ${incoming.length} new signals.`, 'ok');
+      return;
+    }
+
+    await loadPoints(currentCollection, nextLimit);
+    setScanStatus(`Live ingest synced ${pending} new signals.`, 'ok');
+  } catch {
+    await loadPoints(currentCollection, pointLimit);
+    setScanStatus('Live ingest fallback sync complete.', 'muted');
+  } finally {
+    liveIngestSyncInFlight = false;
+  }
 }
 
 function scheduleLiveIngestReload() {
   if (liveIngestReloadTimer) return;
   liveIngestReloadTimer = setTimeout(async () => {
     liveIngestReloadTimer = null;
-    if (!liveIngestEnabled) return;
-    const pending = liveIngestPendingEvents;
-    liveIngestPendingEvents = 0;
-    await loadPoints(currentCollection, pointLimit);
-    setScanStatus(`Live ingest synced ${pending} new signals.`, 'ok');
-  }, 1200);
+    await syncLiveIngestPoints();
+  }, 550);
 }
 
 function handleLiveStreamEvent(raw) {
@@ -1837,10 +1905,14 @@ function handleLiveStreamEvent(raw) {
   const collection = String(raw.collection || '').trim();
   if (collection && collection !== currentCollection) return;
   if (eventType !== 'point_ingested' && eventType !== 'telemetry' && eventType !== 'highlight') return;
-  liveIngestPendingEvents += 1;
-  spawnLiveDropBurst(eventType === 'point_ingested' ? 2 : 1);
-  setScanStatus(`Live ingest: +${liveIngestPendingEvents} pending`, 'ok');
-  scheduleLiveIngestReload();
+  if (eventType === 'point_ingested') {
+    liveIngestPendingEvents += 1;
+    spawnLiveDropBurst(2);
+    setScanStatus(`Live ingest: +${liveIngestPendingEvents} pending`, 'ok');
+    scheduleLiveIngestReload();
+    return;
+  }
+  spawnLiveDropBurst(1);
 }
 
 function startLiveIngestConnection() {
@@ -2337,6 +2409,7 @@ function buildParticles(points, projectionMeta = null) {
   document.getElementById('stat-points').textContent  = n.toLocaleString();
   document.getElementById('stat-visible').textContent = n.toLocaleString();
   document.getElementById('stat-collection').textContent = currentCollection;
+  setLoadStatus('READY', 'muted');
 
   allPoints = points;
   currentProjectionMeta = projectionMeta;
@@ -2580,6 +2653,19 @@ function setScanStatus(message, kind = 'muted') {
   }
 }
 
+function setLoadStatus(text, kind = 'muted') {
+  const el = document.getElementById('stat-load');
+  if (!el) return;
+  el.textContent = text || 'READY';
+  if (kind === 'error') {
+    el.style.color = 'var(--neon-o)';
+  } else if (kind === 'ok') {
+    el.style.color = 'var(--neon-g)';
+  } else {
+    el.style.color = 'var(--text)';
+  }
+}
+
 function isQdrantUnreachableError(message) {
   const m = String(message || '').toLowerCase();
   return m.includes('failed to fetch') ||
@@ -2630,14 +2716,21 @@ function updateLoadingProgressText(progress, collectionLabel) {
   if (progress?.status === 'scrolling') {
     const countText = total > 0 ? `${Math.min(loaded, total).toLocaleString()} / ${total.toLocaleString()}` : `${loaded.toLocaleString()}`;
     loadingSub.textContent = `PULLING ${countText} VECTORS FROM ${upperCollection}… ${Math.min(99, percent)}%`;
+    setLoadStatus(`FETCH ${Math.min(99, percent)}%`, 'muted');
     return;
   }
   if (progress?.status === 'projecting') {
     loadingSub.textContent = `PROJECTING ${Math.max(loaded, total).toLocaleString()} VECTORS…`;
+    setLoadStatus('PROJECTING', 'ok');
     return;
   }
   if (progress?.status === 'done') {
     loadingSub.textContent = 'RENDERING PARTICLE CLOUD…';
+    setLoadStatus('RENDERING', 'ok');
+    return;
+  }
+  if (progress?.status === 'failed') {
+    setLoadStatus('ERROR', 'error');
   }
 }
 
@@ -3223,6 +3316,7 @@ async function loadPoints(collection, limit = pointLimit) {
   document.getElementById('loading-sub').textContent = appendFrom > 0
     ? `APPENDING ${Math.max(0, limit - appendFrom)} VECTORS TO ${collection.toUpperCase()}…`
     : `PULLING ${limit} VECTORS FROM ${collection.toUpperCase()}… 0%`;
+  setLoadStatus(appendFrom > 0 ? 'APPENDING' : 'FETCH 0%', 'muted');
 
   const progressID = `lp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   if (appendFrom > 0) {
@@ -3241,6 +3335,7 @@ async function loadPoints(collection, limit = pointLimit) {
     const data = await res.json();
     stopLoadProgressPolling();
     document.getElementById('loading-sub').textContent = 'RENDERING PARTICLE CLOUD…';
+    setLoadStatus('RENDERING', 'ok');
 
     const incoming = Array.isArray(data.points) ? data.points : [];
     if (appendFrom > 0 && data.incremental) {
@@ -3256,6 +3351,7 @@ async function loadPoints(collection, limit = pointLimit) {
     stopLoadProgressPolling();
     maybeShowQdrantError('Loading points failed', e);
     document.getElementById('loading-sub').textContent = 'ERROR: ' + e.message;
+    setLoadStatus('ERROR', 'error');
     return;
   }
   setTimeout(() => document.getElementById('loading').classList.add('hidden'), 500);
@@ -3328,9 +3424,16 @@ function wireControls() {
     refreshPointSizes();
   });
 
-  document.getElementById('ctrl-size-field').addEventListener('change', e => {
-    sizeField = e.target.value;
+  const sizeFieldCtrl = document.getElementById('ctrl-size-field');
+  const applySizeField = (value) => {
+    sizeField = value;
     refreshPointSizes();
+  };
+  sizeFieldCtrl.addEventListener('input', e => {
+    applySizeField(e.target.value);
+  });
+  sizeFieldCtrl.addEventListener('change', e => {
+    applySizeField(e.target.value);
   });
 
   document.getElementById('ctrl-core-opacity').addEventListener('input', e => {

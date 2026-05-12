@@ -55,7 +55,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Similarity radius scan: run **RADIUS SCAN** to highlight all neighbors above a cosine threshold
 - Similarity highlight mode: selected signal pulses, neighbor signals brighten, unrelated points fade
 - External highlight trigger support via `/api/highlight` for programmatic scanner overlays from other tools
-- Live ingest mode: optional SSE stream (`/api/stream`) with animated drop-in bursts and auto-sync reloads
+- Live ingest mode: optional SSE stream (`/api/stream`) with animated drop-in bursts and live point append in random projection mode (full sync fallback for PCA/t-SNE/UMAP)
 - Durable stream history via Redis Streams with opt-in replay for reconnecting clients
 - Similar Signals side list with rank, score, snippet, and click-to-focus for loaded points
 - Hover preview — inspector updates as you sweep when no point is pinned
@@ -64,7 +64,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 
 **Controls**
 - Real-time sliders: point count, point size, opacity, bloom strength, auto-rotation speed, trail persistence, timeline reveal, hue shift, saturation, lightness
-- Payload-driven size mapping (`score`, `confidence`, `chunk_length`, `text_length`) for semantic salience sizing
+- Payload-driven size mapping (`score`, `confidence`, `chunk_length`, `text_length`) for semantic salience sizing, including nested payload metadata keys
 - Theme switcher: Deep Space, Bioluminescent, Amber Archaeology, Terminal Green
 - Timeline controls for ingestion-order reveal (manual scrub + autoplay)
 - Collection picker — shows point count/vector dim, disables non-projectable collections, and switches without restarting
@@ -72,6 +72,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Collection metadata panel — collection name, point count, vector size, distance metric, projection status
 - Projection axes panel — shows top 3 projection components and variance explained percentages
 - Loading overlay with progress percentage while vectors are fetched and projected
+- Top HUD load-state badge (FETCH / PROJECTING / RENDERING / READY / ERROR) for at-a-glance projection status
 - Responsive HUD collapse for narrow viewports (mobile/tablet)
 - Keyboard shortcuts: `R` reload, `Space` pause/resume rotation, `Esc` clear inspector selection
 - Reload button — re-pull latest vectors on demand
@@ -177,7 +178,7 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  VECTORVIEW  │ COLLECTION  │ POINTS  │ VISIBLE │ FPS  │ [⚙] │  ← Top HUD
+│  VECTORVIEW  │ COLLECTION  │ POINTS  │ VISIBLE │ LOAD │ FPS  │ [⚙] │  ← Top HUD
 ├────────┬────────────────────────────────────────┬───────────┤
 │Controls│                                        │ Inspector │
 │        │                                        │           │
@@ -203,7 +204,7 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | FIND SIMILAR | Run top-K nearest-neighbor scan in current collection |
 | RADIUS SCAN | Highlight all neighbors above selected cosine threshold |
 | CLEAR SCAN | Exit highlight mode and restore normal cloud |
-| Point Count slider | Reload cloud with selected sample size |
+| Point Count slider | Reload cloud with selected sample size (500–75,000) |
 | Hue / Saturation / Lightness | Live palette remapping without reloading |
 | Hover particle | Quick preview (when no pinned signal) |
 | Search + SCAN | Filter to matching points |
