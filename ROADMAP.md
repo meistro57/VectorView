@@ -76,11 +76,11 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 
 ## ⚡ v0.6 — Live Streaming
 
-- [ ] **SSE push endpoint** — `/api/stream` pushes new points as they're ingested
-- [ ] **Live ingest mode** — frontend subscribes to SSE, animates new points dropping into the cloud
-- [ ] **meta_bridge integration** — VectorView watches `mb_chunks` / `mb_claims` collections live during an ingest run
-- [ ] **Redis Pub/Sub bridge** — optional Redis subscriber that forwards bot telemetry into the 3D scene
-- [ ] **WebSocket ping** — heartbeat keeps connection alive across long ingest sessions
+- [x] **SSE push endpoint** — `/api/stream` pushes new points as they're ingested
+- [x] **Live ingest mode** — frontend subscribes to SSE, animates new points dropping into the cloud
+- [x] **meta_bridge integration** — VectorView watches `mb_chunks` / `mb_claims` collections live during an ingest run
+- [x] **Redis Pub/Sub bridge** — optional Redis subscriber that forwards bot telemetry into the 3D scene
+- [x] **WebSocket ping** — heartbeat keeps connection alive across long ingest sessions
 
 ---
 

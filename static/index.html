@@ -758,6 +758,11 @@
   </div>
 
   <div class="ctrl-row">
+    <label>Live Ingest <span id="val-live-ingest">OFF</span></label>
+    <button id="btn-live-ingest" class="scan-btn" style="width:100%;">START LIVE MODE</button>
+  </div>
+
+  <div class="ctrl-row">
     <label>Named Vector</label>
     <input type="text" id="ctrl-vector-name" placeholder="default auto-pick">
   </div>
@@ -1092,6 +1097,15 @@ let currentLoadProgressID = '';
 let currentProjectionMeta = null;
 let highlightPollTimer = null;
 let lastHighlightEventID = '';
+let liveIngestEnabled = false;
+let liveIngestSource = null;
+let liveIngestSocket = null;
+let liveIngestReloadTimer = null;
+let liveIngestPendingEvents = 0;
+let liveDropSystem = null;
+const liveDropMax = 320;
+const liveDropLife = 3.2;
+const liveDrops = [];
 const raycaster = new THREE.Raycaster();
 raycaster.params.Points.threshold = 3.0;
 const mouse = new THREE.Vector2(-9999, -9999);
@@ -1716,6 +1730,171 @@ function renderViewCube() {
   viewCubeRenderer.render(viewCubeScene, viewCubeCamera);
 }
 
+function initLiveDropSystem() {
+  if (!scene) return;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(liveDropMax * 3), 3));
+  geo.setDrawRange(0, 0);
+  const mat = new THREE.PointsMaterial({
+    color: 0x39ff14,
+    size: 6,
+    transparent: true,
+    opacity: 0.8,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    sizeAttenuation: true,
+  });
+  liveDropSystem = new THREE.Points(geo, mat);
+  scene.add(liveDropSystem);
+}
+
+function updateLiveDropSystem() {
+  if (!liveDropSystem) return;
+  const pos = liveDropSystem.geometry.attributes.position.array;
+  const drawCount = Math.min(liveDrops.length, liveDropMax);
+  for (let i = 0; i < drawCount; i++) {
+    const drop = liveDrops[i];
+    pos[i * 3] = drop.x;
+    pos[i * 3 + 1] = drop.y;
+    pos[i * 3 + 2] = drop.z;
+  }
+  liveDropSystem.geometry.setDrawRange(0, drawCount);
+  liveDropSystem.geometry.attributes.position.needsUpdate = true;
+  const alpha = drawCount > 0 ? Math.min(0.85, 0.35 + drawCount / liveDropMax) : 0;
+  liveDropSystem.material.opacity = alpha;
+}
+
+function spawnLiveDropBurst(count = 1) {
+  const center = controls?.target || new THREE.Vector3(0, 0, 0);
+  for (let i = 0; i < count; i++) {
+    if (liveDrops.length >= liveDropMax) {
+      liveDrops.shift();
+    }
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 35 + Math.random() * 110;
+    liveDrops.push({
+      x: center.x + Math.cos(angle) * radius,
+      y: center.y + 220 + Math.random() * 80,
+      z: center.z + Math.sin(angle) * radius,
+      vx: (Math.random() - 0.5) * 8,
+      vy: -(35 + Math.random() * 28),
+      vz: (Math.random() - 0.5) * 8,
+      life: liveDropLife,
+      ttl: liveDropLife,
+    });
+  }
+  updateLiveDropSystem();
+}
+
+function stepLiveDrops(delta) {
+  if (!liveDrops.length) return;
+  const gravity = 26;
+  for (let i = liveDrops.length - 1; i >= 0; i--) {
+    const drop = liveDrops[i];
+    drop.vy -= gravity * delta;
+    drop.x += drop.vx * delta;
+    drop.y += drop.vy * delta;
+    drop.z += drop.vz * delta;
+    drop.life -= delta;
+    if (drop.life <= 0) {
+      liveDrops.splice(i, 1);
+    }
+  }
+  updateLiveDropSystem();
+}
+
+function stopLiveIngestConnection() {
+  if (liveIngestSource) {
+    liveIngestSource.close();
+    liveIngestSource = null;
+  }
+  if (liveIngestSocket) {
+    liveIngestSocket.close();
+    liveIngestSocket = null;
+  }
+  if (liveIngestReloadTimer) {
+    clearTimeout(liveIngestReloadTimer);
+    liveIngestReloadTimer = null;
+  }
+  liveIngestPendingEvents = 0;
+}
+
+function scheduleLiveIngestReload() {
+  if (liveIngestReloadTimer) return;
+  liveIngestReloadTimer = setTimeout(async () => {
+    liveIngestReloadTimer = null;
+    if (!liveIngestEnabled) return;
+    const pending = liveIngestPendingEvents;
+    liveIngestPendingEvents = 0;
+    await loadPoints(currentCollection, pointLimit);
+    setScanStatus(`Live ingest synced ${pending} new signals.`, 'ok');
+  }, 1200);
+}
+
+function handleLiveStreamEvent(raw) {
+  if (!raw || typeof raw !== 'object') return;
+  const eventType = String(raw.type || '').trim();
+  const collection = String(raw.collection || '').trim();
+  if (collection && collection !== currentCollection) return;
+  if (eventType !== 'point_ingested' && eventType !== 'telemetry' && eventType !== 'highlight') return;
+  liveIngestPendingEvents += 1;
+  spawnLiveDropBurst(eventType === 'point_ingested' ? 2 : 1);
+  setScanStatus(`Live ingest: +${liveIngestPendingEvents} pending`, 'ok');
+  scheduleLiveIngestReload();
+}
+
+function startLiveIngestConnection() {
+  stopLiveIngestConnection();
+  const streamURL = `/api/stream?collection=${encodeURIComponent(currentCollection)}&replay=25&max_events_per_second=24`;
+  liveIngestSource = new EventSource(streamURL);
+  liveIngestSource.onmessage = () => {};
+  liveIngestSource.addEventListener('point_ingested', (event) => {
+    try {
+      handleLiveStreamEvent(JSON.parse(event.data));
+    } catch {
+    }
+  });
+  liveIngestSource.addEventListener('telemetry', (event) => {
+    try {
+      handleLiveStreamEvent(JSON.parse(event.data));
+    } catch {
+    }
+  });
+  liveIngestSource.addEventListener('highlight', (event) => {
+    try {
+      handleLiveStreamEvent(JSON.parse(event.data));
+    } catch {
+    }
+  });
+  liveIngestSource.onerror = () => {
+    setScanStatus('Live ingest reconnecting...', 'muted');
+  };
+
+  const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  try {
+    liveIngestSocket = new WebSocket(`${wsProtocol}//${location.host}/api/ws`);
+  } catch {
+    liveIngestSocket = null;
+  }
+}
+
+function setLiveIngestMode(enabled) {
+  liveIngestEnabled = !!enabled;
+  const btn = document.getElementById('btn-live-ingest');
+  const val = document.getElementById('val-live-ingest');
+  if (liveIngestEnabled) {
+    btn.textContent = 'STOP LIVE MODE';
+    btn.classList.add('secondary');
+    val.textContent = 'ON';
+    startLiveIngestConnection();
+  } else {
+    btn.textContent = 'START LIVE MODE';
+    btn.classList.remove('secondary');
+    val.textContent = 'OFF';
+    stopLiveIngestConnection();
+  }
+}
+
 // ── Init Three.js ─────────────────────────────────────────────────────────────
 function initTrailPipeline() {
   if (!renderer) return;
@@ -1855,6 +2034,7 @@ function initScene() {
 
   initTrailPipeline();
   initViewCube();
+  initLiveDropSystem();
 
   // Star field background
   addStarField();
@@ -2932,6 +3112,7 @@ function animate() {
 
   controls.setAutoRotateSpeed(rotSpeed);
   controls.update();
+  stepLiveDrops(delta);
   checkHover();
 
   if (particleSystem) {
@@ -3234,6 +3415,9 @@ function wireControls() {
     currentCollection = e.target.value;
     lastHighlightEventID = '';
     updateCollectionMetaPanel(currentCollection);
+    if (liveIngestEnabled) {
+      startLiveIngestConnection();
+    }
     loadPoints(currentCollection, pointLimit);
     document.getElementById('search-status').textContent = '';
     document.getElementById('search-input').value = '';
@@ -3241,6 +3425,10 @@ function wireControls() {
 
   document.getElementById('btn-reload').addEventListener('click', () => {
     loadPoints(currentCollection, pointLimit);
+  });
+
+  document.getElementById('btn-live-ingest').addEventListener('click', () => {
+    setLiveIngestMode(!liveIngestEnabled);
   });
 
   document.getElementById('btn-snapshot').addEventListener('click', () => {
@@ -3283,6 +3471,7 @@ function wireControls() {
   crossSel.style.opacity = searchMode === 'semantic' ? '1' : '0.6';
 
   updateSignalButtons();
+  setLiveIngestMode(false);
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────

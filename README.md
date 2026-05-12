@@ -55,6 +55,8 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Similarity radius scan: run **RADIUS SCAN** to highlight all neighbors above a cosine threshold
 - Similarity highlight mode: selected signal pulses, neighbor signals brighten, unrelated points fade
 - External highlight trigger support via `/api/highlight` for programmatic scanner overlays from other tools
+- Live ingest mode: optional SSE stream (`/api/stream`) with animated drop-in bursts and auto-sync reloads
+- Durable stream history via Redis Streams with opt-in replay for reconnecting clients
 - Similar Signals side list with rank, score, snippet, and click-to-focus for loaded points
 - Hover preview — inspector updates as you sweep when no point is pinned
 - Payload text search — keyword scan returns a filtered sub-cloud, re-projected live
@@ -73,6 +75,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Responsive HUD collapse for narrow viewports (mobile/tablet)
 - Keyboard shortcuts: `R` reload, `Space` pause/resume rotation, `Esc` clear inspector selection
 - Reload button — re-pull latest vectors on demand
+- Live mode toggle — subscribe to stream events and keep a WebSocket heartbeat alive during long ingest sessions
 - Screenshot button — export current viewport as PNG
 
 **Architecture**
@@ -147,6 +150,18 @@ VECTORVIEW_MAX_POINTS=2000
 # Optional Redis projection cache (recommended for instant reloads)
 VECTORVIEW_REDIS_URL=
 VECTORVIEW_CACHE_TTL_SECONDS=600
+
+# Live streaming + ingest integrations
+VECTORVIEW_STREAM_HEARTBEAT_SECONDS=15
+VECTORVIEW_STREAM_REPLAY_COUNT=0
+VECTORVIEW_STREAM_MAX_EVENTS_PER_SECOND=30
+VECTORVIEW_WS_PING_SECONDS=20
+VECTORVIEW_META_BRIDGE_LIVE=true
+VECTORVIEW_META_BRIDGE_COLLECTIONS=mb_chunks,mb_claims
+VECTORVIEW_META_BRIDGE_POLL_SECONDS=3
+VECTORVIEW_REDIS_PUBSUB_CHANNEL=vectorview.telemetry
+VECTORVIEW_REDIS_STREAM_KEY=vectorview.events
+VECTORVIEW_REDIS_STREAM_MAXLEN=20000
 
 # Semantic search embedding provider
 VECTORVIEW_SEMANTIC_PROVIDER=ollama
@@ -252,6 +267,13 @@ GET  /api/collections/{collection}/points/{point_id}/similar-radius?radius=R&lim
 POST /api/collections/{collection}/points/{point_id}/similar-radius               → same as above (JSON body supports {"radius": R, "limit": N})
 POST /api/highlight                                                                 → publish external highlight event ({"collection":"X","ids":[...],"focus_id":"..."})
 GET  /api/highlight?collection=X&since=event_id                                     → poll latest external highlight event (204 when unchanged)
+GET  /api/stream?collection=X&heartbeat_seconds=N&replay=K&max_events_per_second=M  → SSE stream for ingest/highlight/telemetry with optional replay + server-side throttling
+GET  /api/ws                                                                         → WebSocket heartbeat endpoint (server ping frames)
+
+`/api/stream` notes:
+- `replay=K` replays up to `K` most recent events from Redis Streams (`VECTORVIEW_REDIS_STREAM_KEY`) before live events.
+- `max_events_per_second=M` applies server-side rate limiting; when bursty, newest event wins (coalesced backpressure behavior).
+- Replay is capped at 1000 events per request.
 ```
 
 Example response from `/api/collections`:

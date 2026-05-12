@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
@@ -143,6 +144,179 @@ type highlightEvent struct {
 	CreatedAt  int64         `json:"created_at"`
 }
 
+type streamEvent struct {
+	Type       string      `json:"type"`
+	Collection string      `json:"collection,omitempty"`
+	Timestamp  int64       `json:"timestamp"`
+	Payload    interface{} `json:"payload,omitempty"`
+}
+
+type streamSubscriber struct {
+	Collection string
+	Channel    chan []byte
+}
+
+type redisStreamRecorder struct {
+	client *redis.Client
+	key    string
+	maxLen int64
+}
+
+func newRedisStreamRecorder(redisURL, key string, maxLen int64) (*redisStreamRecorder, error) {
+	redisURL = strings.TrimSpace(redisURL)
+	key = strings.TrimSpace(key)
+	if redisURL == "" || key == "" {
+		return nil, nil
+	}
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid redis stream recorder url: %w", err)
+	}
+	client := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("redis stream recorder ping failed: %w", err)
+	}
+	if maxLen <= 0 {
+		maxLen = 20000
+	}
+	return &redisStreamRecorder{client: client, key: key, maxLen: maxLen}, nil
+}
+
+func (r *redisStreamRecorder) append(ctx context.Context, evt streamEvent, encoded []byte) error {
+	if r == nil || r.client == nil || strings.TrimSpace(r.key) == "" || len(encoded) == 0 {
+		return nil
+	}
+	values := map[string]interface{}{
+		"event":      string(encoded),
+		"type":       evt.Type,
+		"collection": evt.Collection,
+		"timestamp":  evt.Timestamp,
+	}
+	args := &redis.XAddArgs{Stream: r.key, MaxLen: r.maxLen, Approx: true, Values: values}
+	return r.client.XAdd(ctx, args).Err()
+}
+
+func (r *redisStreamRecorder) replay(ctx context.Context, count int, collection string) ([][]byte, error) {
+	if r == nil || r.client == nil || strings.TrimSpace(r.key) == "" || count <= 0 {
+		return nil, nil
+	}
+	entries, err := r.client.XRevRangeN(ctx, r.key, "+", "-", int64(count)).Result()
+	if err != nil {
+		return nil, err
+	}
+	collection = strings.TrimSpace(collection)
+	out := make([][]byte, 0, len(entries))
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		if collection != "" {
+			entryCollection := strings.TrimSpace(fmt.Sprintf("%v", entry.Values["collection"]))
+			if entryCollection != "" && entryCollection != collection {
+				continue
+			}
+		}
+		rawEvent, ok := entry.Values["event"]
+		if !ok {
+			continue
+		}
+		text := strings.TrimSpace(fmt.Sprintf("%v", rawEvent))
+		if text == "" {
+			continue
+		}
+		out = append(out, []byte(text))
+	}
+	return out, nil
+}
+
+type streamHub struct {
+	mu       sync.RWMutex
+	nextID   int
+	subs     map[int]streamSubscriber
+	recorder *redisStreamRecorder
+}
+
+func newStreamHub(recorder *redisStreamRecorder) *streamHub {
+	return &streamHub{subs: make(map[int]streamSubscriber), recorder: recorder}
+}
+
+func (h *streamHub) subscribe(collection string) (int, chan []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.nextID++
+	id := h.nextID
+	ch := make(chan []byte, 64)
+	h.subs[id] = streamSubscriber{Collection: strings.TrimSpace(collection), Channel: ch}
+	return id, ch
+}
+
+func (h *streamHub) unsubscribe(id int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	sub, ok := h.subs[id]
+	if !ok {
+		return
+	}
+	delete(h.subs, id)
+	close(sub.Channel)
+}
+
+func (h *streamHub) replay(ctx context.Context, count int, collection string) ([][]byte, error) {
+	if h == nil {
+		return nil, nil
+	}
+	return h.recorder.replay(ctx, count, collection)
+}
+
+func streamEventType(payload []byte) string {
+	if len(payload) == 0 {
+		return "event"
+	}
+	var envelope streamEvent
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return "event"
+	}
+	eventType := strings.TrimSpace(envelope.Type)
+	if eventType == "" {
+		return "event"
+	}
+	return eventType
+}
+
+func (h *streamHub) publish(eventType, collection string, payload interface{}) {
+	if h == nil {
+		return
+	}
+	evt := streamEvent{
+		Type:       strings.TrimSpace(eventType),
+		Collection: strings.TrimSpace(collection),
+		Timestamp:  time.Now().UnixMilli(),
+		Payload:    payload,
+	}
+	if evt.Type == "" {
+		evt.Type = "event"
+	}
+	encoded, err := json.Marshal(evt)
+	if err != nil {
+		return
+	}
+	if err := h.recorder.append(context.Background(), evt, encoded); err != nil {
+		log.Printf("stream recorder append error: %v", err)
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, sub := range h.subs {
+		if sub.Collection != "" && sub.Collection != evt.Collection {
+			continue
+		}
+		select {
+		case sub.Channel <- encoded:
+		default:
+		}
+	}
+}
+
 // ── API response types ────────────────────────────────────────────────────────
 
 type PointsResponse struct {
@@ -192,6 +366,7 @@ type loadProgress struct {
 
 var pointsLoadProgress sync.Map
 var highlightEvents sync.Map
+var wsUpgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 type projectionCache interface {
 	Get(ctx context.Context, key string) (*PointsResponse, bool, error)
@@ -720,6 +895,106 @@ func parseFetchProgressLine(line string) (int, int, bool) {
 	return loaded, limit, true
 }
 
+func writeSSEEvent(w io.Writer, eventType string, payload []byte) error {
+	if _, err := fmt.Fprintf(w, "event: %s\n", strings.TrimSpace(eventType)); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+func watchCollectionStream(ctx context.Context, q *qdrantClient, hub *streamHub, collection string, pollInterval time.Duration) {
+	collection = strings.TrimSpace(collection)
+	if collection == "" {
+		return
+	}
+	offset := 0
+	if meta, err := q.collectionMeta(ctx, collection); err == nil {
+		offset = int(meta.PointsCount)
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			points, err := q.fetchPointsWindow(ctx, collection, offset, 64)
+			if err != nil {
+				log.Printf("meta_bridge watch error collection=%s: %v", collection, err)
+				continue
+			}
+			if len(points) == 0 {
+				continue
+			}
+			offset += len(points)
+			for _, point := range points {
+				hub.publish("point_ingested", collection, map[string]interface{}{
+					"id":      point.ID,
+					"payload": point.Payload,
+				})
+			}
+		}
+	}
+}
+
+func startMetaBridgeWatchers(ctx context.Context, q *qdrantClient, hub *streamHub, collections []string, pollInterval time.Duration) {
+	if len(collections) == 0 {
+		return
+	}
+	for _, rawCollection := range collections {
+		collection := strings.TrimSpace(rawCollection)
+		if collection == "" {
+			continue
+		}
+		go watchCollectionStream(ctx, q, hub, collection, pollInterval)
+		log.Printf("meta_bridge watcher enabled for collection=%s", collection)
+	}
+}
+
+func startRedisTelemetryBridge(ctx context.Context, redisURL, channel string, hub *streamHub) {
+	redisURL = strings.TrimSpace(redisURL)
+	channel = strings.TrimSpace(channel)
+	if redisURL == "" || channel == "" {
+		return
+	}
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Printf("redis telemetry bridge disabled: invalid redis url: %v", err)
+		return
+	}
+	client := redis.NewClient(opts)
+	pubsub := client.Subscribe(ctx, channel)
+	go func() {
+		defer pubsub.Close()
+		defer client.Close()
+		for {
+			msg, err := pubsub.ReceiveMessage(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("redis telemetry bridge receive error: %v", err)
+				continue
+			}
+			var decoded interface{}
+			if err := json.Unmarshal([]byte(msg.Payload), &decoded); err != nil {
+				decoded = map[string]interface{}{"message": msg.Payload}
+			}
+			collection := ""
+			if asMap, ok := decoded.(map[string]interface{}); ok {
+				if v, ok := asMap["collection"]; ok {
+					collection = strings.TrimSpace(fmt.Sprintf("%v", v))
+				}
+			}
+			hub.publish("telemetry", collection, decoded)
+		}
+	}()
+	log.Printf("redis telemetry bridge subscribed channel=%s", channel)
+}
+
 // runGPUPCA calls pca_gpu.py and returns projected points response
 func runGPUPCA(collection string, limit int, qdrantURL, projectionMethod, vectorName, progressID string) (PointsResponse, error) {
 	py := pythonBin()
@@ -866,9 +1141,10 @@ func main() {
 	}
 
 	q := newQdrant(qdrantURL, qdrantKey)
+	redisURL := strings.TrimSpace(os.Getenv("VECTORVIEW_REDIS_URL"))
 
 	var pointsCache projectionCache
-	if redisURL := strings.TrimSpace(os.Getenv("VECTORVIEW_REDIS_URL")); redisURL != "" {
+	if redisURL != "" {
 		cacheTTLSeconds, err := strconv.Atoi(envOr("VECTORVIEW_CACHE_TTL_SECONDS", "600"))
 		if err != nil || cacheTTLSeconds <= 0 {
 			cacheTTLSeconds = 600
@@ -890,6 +1166,44 @@ func main() {
 	semanticProvider := strings.ToLower(strings.TrimSpace(envOr("VECTORVIEW_SEMANTIC_PROVIDER", "ollama")))
 	embedModel := strings.TrimSpace(envOr("VECTORVIEW_EMBED_MODEL", "nomic-embed-text"))
 	ollamaURL := strings.TrimSpace(envOr("VECTORVIEW_OLLAMA_URL", "http://localhost:11434"))
+	streamHeartbeatSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_STREAM_HEARTBEAT_SECONDS", "15"))
+	if streamHeartbeatSeconds <= 0 {
+		streamHeartbeatSeconds = 15
+	}
+	wsPingSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_WS_PING_SECONDS", "20"))
+	if wsPingSeconds <= 0 {
+		wsPingSeconds = 20
+	}
+	metaBridgeEnabled, err := strconv.ParseBool(strings.TrimSpace(envOr("VECTORVIEW_META_BRIDGE_LIVE", "true")))
+	if err != nil {
+		metaBridgeEnabled = true
+	}
+	metaBridgeCollections := strings.Split(strings.TrimSpace(envOr("VECTORVIEW_META_BRIDGE_COLLECTIONS", "mb_chunks,mb_claims")), ",")
+	metaBridgePollSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_META_BRIDGE_POLL_SECONDS", "3"))
+	if metaBridgePollSeconds <= 0 {
+		metaBridgePollSeconds = 3
+	}
+	redisTelemetryChannel := strings.TrimSpace(envOr("VECTORVIEW_REDIS_PUBSUB_CHANNEL", "vectorview.telemetry"))
+	streamReplayDefault, _ := strconv.Atoi(envOr("VECTORVIEW_STREAM_REPLAY_COUNT", "0"))
+	if streamReplayDefault < 0 {
+		streamReplayDefault = 0
+	}
+	streamMaxEventsPerSecond, _ := strconv.Atoi(envOr("VECTORVIEW_STREAM_MAX_EVENTS_PER_SECOND", "30"))
+	if streamMaxEventsPerSecond <= 0 {
+		streamMaxEventsPerSecond = 30
+	}
+	streamRecorderKey := strings.TrimSpace(envOr("VECTORVIEW_REDIS_STREAM_KEY", "vectorview.events"))
+	streamRecorderMaxLen, _ := strconv.ParseInt(envOr("VECTORVIEW_REDIS_STREAM_MAXLEN", "20000"), 10, 64)
+	if streamRecorderMaxLen <= 0 {
+		streamRecorderMaxLen = 20000
+	}
+	streamRecorder, err := newRedisStreamRecorder(redisURL, streamRecorderKey, streamRecorderMaxLen)
+	if err != nil {
+		log.Printf("Redis stream recorder disabled: %v", err)
+	}
+	streamHub := newStreamHub(streamRecorder)
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
@@ -939,6 +1253,158 @@ func main() {
 		json.NewEncoder(w).Encode(value)
 	})
 
+	mux.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		collection := strings.TrimSpace(r.URL.Query().Get("collection"))
+		heartbeatSeconds, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("heartbeat_seconds")))
+		if err != nil || heartbeatSeconds <= 0 {
+			heartbeatSeconds = streamHeartbeatSeconds
+		}
+		replayCount, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("replay")))
+		if err != nil || replayCount < 0 {
+			replayCount = streamReplayDefault
+		}
+		if replayCount > 1000 {
+			replayCount = 1000
+		}
+		maxEventsPerSecond, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("max_events_per_second")))
+		if err != nil || maxEventsPerSecond <= 0 {
+			maxEventsPerSecond = streamMaxEventsPerSecond
+		}
+		if maxEventsPerSecond <= 0 {
+			maxEventsPerSecond = 1
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		subID, stream := streamHub.subscribe(collection)
+		defer streamHub.unsubscribe(subID)
+
+		readyPayload, _ := json.Marshal(map[string]interface{}{"status": "ready", "collection": collection, "replay": replayCount, "max_events_per_second": maxEventsPerSecond})
+		if err := writeSSEEvent(w, "stream_ready", readyPayload); err != nil {
+			return
+		}
+		flusher.Flush()
+
+		if replayCount > 0 {
+			replayed, err := streamHub.replay(r.Context(), replayCount, collection)
+			if err != nil {
+				log.Printf("stream replay error: %v", err)
+			} else {
+				for _, payload := range replayed {
+					if err := writeSSEEvent(w, streamEventType(payload), payload); err != nil {
+						return
+					}
+				}
+				flusher.Flush()
+			}
+		}
+
+		heartbeatTicker := time.NewTicker(time.Duration(heartbeatSeconds) * time.Second)
+		defer heartbeatTicker.Stop()
+		rateTicker := time.NewTicker(time.Second / time.Duration(maxEventsPerSecond))
+		defer rateTicker.Stop()
+		nextSendAt := time.Now()
+		var pendingPayload []byte
+		pendingType := "event"
+
+		flushPending := func() bool {
+			if len(pendingPayload) == 0 || time.Now().Before(nextSendAt) {
+				return true
+			}
+			if err := writeSSEEvent(w, pendingType, pendingPayload); err != nil {
+				return false
+			}
+			flusher.Flush()
+			pendingPayload = nil
+			nextSendAt = time.Now().Add(time.Second / time.Duration(maxEventsPerSecond))
+			return true
+		}
+
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case payload, ok := <-stream:
+				if !ok {
+					return
+				}
+				eventType := streamEventType(payload)
+				if time.Now().After(nextSendAt) || time.Now().Equal(nextSendAt) {
+					if err := writeSSEEvent(w, eventType, payload); err != nil {
+						return
+					}
+					flusher.Flush()
+					nextSendAt = time.Now().Add(time.Second / time.Duration(maxEventsPerSecond))
+					continue
+				}
+				pendingPayload = payload
+				pendingType = eventType
+			case <-rateTicker.C:
+				if !flushPending() {
+					return
+				}
+			case <-heartbeatTicker.C:
+				if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	})
+
+	mux.HandleFunc("/api/ws", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Duration(wsPingSeconds) * time.Second))
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(2 * time.Duration(wsPingSeconds) * time.Second))
+		})
+
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}()
+
+		ticker := time.NewTicker(time.Duration(wsPingSeconds) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				deadline := time.Now().Add(5 * time.Second)
+				if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), deadline); err != nil {
+					return
+				}
+			}
+		}
+	})
+
 	mux.HandleFunc("/api/highlight", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
 		switch r.Method {
@@ -974,6 +1440,7 @@ func main() {
 				event.FocusID = ids[0]
 			}
 			highlightEvents.Store(collection, event)
+			streamHub.publish("highlight", collection, event)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(event)
 		case http.MethodGet:
@@ -1445,6 +1912,13 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
+
+	if metaBridgeEnabled {
+		startMetaBridgeWatchers(streamCtx, q, streamHub, metaBridgeCollections, time.Duration(metaBridgePollSeconds)*time.Second)
+	}
+	if redisURL := strings.TrimSpace(os.Getenv("VECTORVIEW_REDIS_URL")); redisURL != "" {
+		startRedisTelemetryBridge(streamCtx, redisURL, redisTelemetryChannel, streamHub)
+	}
 
 	addr := ":" + port
 	log.Printf("🚀 VectorView running → http://localhost%s", addr)
