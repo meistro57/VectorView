@@ -42,35 +42,35 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 
 ## 🧠 v0.3 — Smarter Projection
 
-- [ ] **UMAP via subprocess or WASM** — optional upgrade from PCA for non-linear structure
-- [ ] **Incremental projection** — add new points to existing scene without full re-project
-- [ ] **Projection caching** — cache PCA result to disk, serve instantly on reload
+- [x] **UMAP via subprocess or WASM** — optional upgrade from PCA for non-linear structure
+- [x] **Incremental projection** — add new points to existing scene without full re-project
+- [x] **Projection caching** — cache PCA result to disk, serve instantly on reload
 - [x] **Axis labels** — show what PC1/PC2/PC3 correspond to (variance explained %)
 - [x] **Projection selector** — UI toggle between PCA / random / t-SNE (server-side)
-- [ ] **Advanced named vector support** — explicit vector selection for collections with multiple named vectors (basic first-vector fallback now exists)
+- [x] **Advanced named vector support** — explicit vector selection for collections with multiple named vectors (basic first-vector fallback now exists)
 
 ---
 
 ## 🔍 v0.4 — Vector Search
 
-- [ ] **Semantic search** — embed a query string (via Ollama or OpenRouter) and do true nearest-neighbor search against Qdrant
+- [x] **Semantic search** — embed a query string (via Ollama or OpenRouter) and do true nearest-neighbor search against Qdrant
 - [x] **Signal Scanner (top-K neighbors)** — click a point, run nearest-neighbor scan, highlight matches, and inspect ranked results
 - [x] **Similarity radius** — click a point, highlight all neighbors within cosine distance threshold
 - [x] **Distance matrix heatmap** — 2D mini-heatmap of inter-cluster distances in the HUD
 - [x] **Outlier detection** — flag points with low neighbor density (rare finds) in a distinct color
-- [ ] **Cross-collection search** — query one collection, highlight matches in another
+- [x] **Cross-collection search** — query one collection, highlight matches in another
 
 ---
 
 ## 🎨 v0.5 — Visual Depth
 
-- [ ] **Particle trails** — ghost trail behind auto-rotating camera, stored in off-screen texture
-- [ ] **Cluster convex hulls** — translucent mesh wrapping each color cluster
-- [ ] **Density fog** — thicker fog in low-density regions, clearing near clusters
-- [ ] **Point size by payload field** — e.g. size by `score`, `confidence`, or chunk length
-- [ ] **Time axis** — animate points appearing in ingestion order (timeline scrubber)
-- [ ] **Screenshot export** — capture current view as PNG from HUD button
-- [ ] **Theme switcher** — deep space (default), bioluminescent, amber archaeology, terminal green
+- [x] **Particle trails** — ghost trail behind auto-rotating camera, stored in off-screen texture
+- [x] **Cluster convex hulls** — translucent mesh wrapping each color cluster
+- [x] **Density fog** — thicker fog in low-density regions, clearing near clusters
+- [x] **Point size by payload field** — e.g. size by `score`, `confidence`, or chunk length
+- [x] **Time axis** — animate points appearing in ingestion order (timeline scrubber)
+- [x] **Screenshot export** — capture current view as PNG from HUD button
+- [x] **Theme switcher** — deep space (default), bioluminescent, amber archaeology, terminal green
 
 ---
 

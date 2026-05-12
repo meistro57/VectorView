@@ -36,10 +36,13 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 
 **Visualization**
 - Live 3D particle cloud rendered via custom WebGL shaders — additive blending, pulsing glow, dual-layer bloom
-- Unified projection pipeline: both `/api/points` and `/api/search` use `pca_gpu.py` (PyTorch/CuPy/NumPy) with selectable `pca`, `random`, or `tsne` modes
+- Unified projection pipeline: both `/api/points` and `/api/search` use `pca_gpu.py` (PyTorch/CuPy/NumPy) with selectable `pca`, `random`, `tsne`, or `umap` modes
 - Projection auto-selects the dominant dense vector dimension and skips incompatible vectors, then returns per-axis variance metadata for HUD readout
 - Color-coded clusters derived from source payload keys (`file_source`, `source_id`, `source_collection`, `source_file`, `source`) with lowercase/UPPERCASE compatibility
 - Exponential fog, starfield background, and a subtle grid anchor the scene in deep space
+- Cluster convex hull overlays (translucent + wireframe) for dominant visible clusters
+- Density-aware fog tuning updates per load to emphasize sparse vs dense structures
+- Particle trail compositor (off-screen ping-pong textures) for ghosted motion during navigation
 - Cluster distance matrix heatmap in the HUD (top clusters by centroid distance)
 - Outlier detection marks sparse low-density points in a distinct color
 - Friendly error overlay when Qdrant is unreachable
@@ -57,7 +60,10 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Payload compatibility layer in UI: title/snippet/source/inspector fields resolve mixed-case keys (for example `source_id` and `SOURCE_ID`)
 
 **Controls**
-- Real-time sliders: point count, point size, opacity, bloom strength, auto-rotation speed, hue shift, saturation, lightness
+- Real-time sliders: point count, point size, opacity, bloom strength, auto-rotation speed, trail persistence, timeline reveal, hue shift, saturation, lightness
+- Payload-driven size mapping (`score`, `confidence`, `chunk_length`, `text_length`) for semantic salience sizing
+- Theme switcher: Deep Space, Bioluminescent, Amber Archaeology, Terminal Green
+- Timeline controls for ingestion-order reveal (manual scrub + autoplay)
 - Collection picker — shows point count/vector dim, disables non-projectable collections, and switches without restarting
 - Projection selector — switch between PCA / random / t-SNE and reload current view with the selected method
 - Collection metadata panel — collection name, point count, vector size, distance metric, projection status
@@ -66,6 +72,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Responsive HUD collapse for narrow viewports (mobile/tablet)
 - Keyboard shortcuts: `R` reload, `Space` pause/resume rotation, `Esc` clear inspector selection
 - Reload button — re-pull latest vectors on demand
+- Screenshot button — export current viewport as PNG
 
 **Architecture**
 - Single Go binary with `//go:embed` — ships the entire frontend inside the executable
@@ -93,6 +100,8 @@ go mod tidy
 python3 -m pip install numpy
 # optional: required only for projection=tsne
 python3 -m pip install scikit-learn
+# optional: required only for projection=umap
+python3 -m pip install umap-learn
 go run .
 ```
 
@@ -122,6 +131,15 @@ VECTORVIEW_PORT=7433
 # Max points pulled per collection
 # PCA is O(n × dim) — keep this sane for large collections
 VECTORVIEW_MAX_POINTS=2000
+
+# Optional Redis projection cache (recommended for instant reloads)
+VECTORVIEW_REDIS_URL=
+VECTORVIEW_CACHE_TTL_SECONDS=600
+
+# Semantic search embedding provider
+VECTORVIEW_SEMANTIC_PROVIDER=ollama
+VECTORVIEW_OLLAMA_URL=http://localhost:11434
+VECTORVIEW_EMBED_MODEL=nomic-embed-text
 ```
 
 Environment variables override `.env` — works cleanly with Docker and systemd.
@@ -163,6 +181,9 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | Hover particle | Quick preview (when no pinned signal) |
 | Search + SCAN | Filter to matching points |
 | Collection picker | Switch active collection |
+| Theme selector | Swap full scene/HUD palette |
+| Timeline Reveal + Auto | Scrub/animate ingestion-order reveal |
+| 📸 SNAPSHOT | Export current viewport as PNG |
 | ↺ RELOAD | Re-pull vectors from Qdrant |
 | R / Space / Esc | Reload / pause rotation / clear inspector |
 
@@ -172,9 +193,10 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 
 VectorView uses a **unified projection pipeline**:
 
-1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, detects the most common dense vector dimension in the sample, keeps vectors matching that dimension, runs the selected projection (`pca`, `random`, or `tsne`), and returns normalized 3D coordinates.
+1. **`/api/points` path (full collection):** Go spawns `pca_gpu.py`, which scrolls vectors from Qdrant, detects the most common dense vector dimension in the sample (or a selected named vector), keeps vectors matching that dimension, runs the selected projection (`pca`, `random`, `tsne`, or `umap`), and returns normalized 3D coordinates.
 2. **`/api/search` path (filtered subset):** Go fetches keyword-matched points, then calls the same `pca_gpu.py` worker via stdin with the selected projection method, so behavior matches full-load projection.
 3. **Normalize + metadata** — coordinates are scaled into a ±100 unit cube and responses include projection metadata (`method`, top 3 component labels, variance explained %) for HUD axis readout.
+4. **Redis caching + incremental append** — when `VECTORVIEW_REDIS_URL` is set, `/api/points` responses are cached by collection + limit + projection + vector name. Random projection loads can request `append_from=N` to add only newly requested points without recomputing the existing projected subset.
 
 The result: semantically similar points cluster together in 3D space. The geometry you see **is** the structure of your knowledge base.
 
@@ -194,10 +216,11 @@ Signal Scanner turns the inspector into a neighborhood probe:
 ### Similarity assumptions and limits
 
 - Endpoint uses the selected point vector directly against `/points/search` in the same collection.
-- If vectors are named, VectorView picks the first detected named vector key from the selected point payload and sends `{name, vector}`.
+- If vectors are named, VectorView can send a requested `vector_name`; otherwise it falls back to the first detected named vector key from the selected point payload.
 - `limit` defaults to `12` and is capped to `500` server-side.
 - If neighbors are returned by Qdrant but not present in the currently loaded point sample, they still appear in the Similar Signals list and are marked as outside the visible sample.
-- Current search endpoint remains payload-text search; it does not yet combine keyword scan + nearest-neighbor reranking.
+- Search bar supports **KEYWORD** mode (`/api/search`) and **SEMANTIC** mode (`/api/semantic-search`). Semantic mode embeds the query with Ollama (`VECTORVIEW_OLLAMA_URL`, `VECTORVIEW_EMBED_MODEL`) and then runs nearest-neighbor search.
+- Semantic mode supports cross-collection querying via `target_collection`: run the query from one active collection and project matches from another.
 
 ---
 
@@ -208,8 +231,9 @@ VectorView exposes a small REST API that the frontend uses — useful for script
 ```
 GET  /api/collections                                                             → list all Qdrant collections with metadata + projection readiness
 GET  /api/load-progress?id=progress_id                                            → live projection/fetch progress for active /api/points request
-GET  /api/points?collection=X&limit=N&projection=pca|random|tsne&progress_id=token → full-collection projection via Python worker
-GET  /api/search?collection=X&q=term&limit=N&projection=pca|random|tsne           → payload keyword search + Python worker reprojection (mixed-case payload key support)
+GET  /api/points?collection=X&limit=N&projection=pca|random|tsne|umap&vector_name=V&append_from=N&progress_id=token → full projection, cache-aware load, or incremental random append
+GET  /api/search?collection=X&q=term&limit=N&projection=pca|random|tsne|umap&vector_name=V                           → payload keyword search + Python worker reprojection (mixed-case payload key support)
+GET  /api/semantic-search?collection=X&target_collection=Y&q=term&limit=N&projection=pca|random|tsne|umap&vector_name=V → embed query text via Ollama; if target_collection is set, search in that collection and project its hits
 GET  /api/collections/{collection}/points/{point_id}/similar?limit=N              → nearest-neighbor top-K scan from selected point vector
 POST /api/collections/{collection}/points/{point_id}/similar                      → same as above (JSON body supports {"limit": N})
 GET  /api/collections/{collection}/points/{point_id}/similar-radius?radius=R&limit=N → cosine-threshold neighborhood scan
@@ -304,7 +328,7 @@ Example response from `/api/collections/{collection}/points/{point_id}/similar-r
 ```
 VectorView/
 ├── main.go          # Go server — Qdrant client, API handlers, projection orchestration, embed
-├── pca_gpu.py       # Python projection worker for /api/points and /api/search (PCA/random/t-SNE)
+├── pca_gpu.py       # Python projection worker for /api/points, /api/search, /api/semantic-search (PCA/random/t-SNE/UMAP)
 ├── static/
 │   └── index.html   # Entire frontend — Three.js, GLSL shaders, HUD
 ├── go.mod

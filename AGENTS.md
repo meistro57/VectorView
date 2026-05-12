@@ -30,26 +30,33 @@
   - `QDRANT_API_KEY`
   - `VECTORVIEW_PORT` (default `7433`)
   - `VECTORVIEW_MAX_POINTS` (default `2000`)
+  - `VECTORVIEW_REDIS_URL` (optional Redis projection cache)
+  - `VECTORVIEW_CACHE_TTL_SECONDS` (default `600`)
+  - `VECTORVIEW_SEMANTIC_PROVIDER` (default `ollama`)
+  - `VECTORVIEW_OLLAMA_URL` (default `http://localhost:11434`)
+  - `VECTORVIEW_EMBED_MODEL` (default `nomic-embed-text`)
 
 ## Architecture and Data Flow
 
 ### High-level shape
-- `main.go`: backend server, Qdrant HTTP client, API handlers, inline Go PCA, static embed.
-- `pca_gpu.py`: subprocess worker for full-collection PCA.
+- `main.go`: backend server, Qdrant HTTP client, API handlers, Redis-backed projection cache, semantic embedding calls, static embed.
+- `pca_gpu.py`: subprocess worker for projection (`pca` / `random` / `tsne` / `umap`).
 - `static/index.html`: entire frontend (HTML + CSS + JS + shaders + controls) in one file.
 
 ### Backend request flow
 1. Browser loads `/` from Go `http.FileServer` over embedded `static/*`.
 2. Frontend calls API routes on same origin:
    - `GET /api/collections`
-   - `GET /api/points?collection=&limit=`
-   - `GET /api/search?collection=&q=&limit=`
-3. Backend talks to Qdrant using raw HTTP (`/collections`, `/collections/{name}`, `/collections/{name}/points/scroll`).
+   - `GET /api/points?collection=&limit=&projection=&vector_name=&append_from=`
+   - `GET /api/search?collection=&q=&limit=&projection=&vector_name=`
+   - `GET /api/semantic-search?collection=&target_collection=&q=&limit=&projection=&vector_name=`
+3. Backend talks to Qdrant using raw HTTP (`/collections`, `/collections/{name}`, `/collections/{name}/points/scroll`, `/collections/{name}/points/search`).
 
 ### Projection paths (important)
-- `/api/points`: Go spawns `pca_gpu.py` (`exec.CommandContext`) and returns its JSON output.
-- `/api/search`: Go fetches filtered points from Qdrant and runs inline Go PCA (`goPCA3D`) without spawning Python.
-- Both projection paths now choose the most common dense vector dimension and skip vectors that do not match that target dimension.
+- `/api/points`: Go serves from Redis cache when available; otherwise spawns `pca_gpu.py` (`exec.CommandContext`) and stores response in Redis.
+- `/api/points` also supports incremental append (`append_from`) for random projection when a cached base subset exists.
+- `/api/search` and `/api/semantic-search` both call `pca_gpu.py` via stdin for projection consistency.
+- Projection worker chooses the most common dense vector dimension (or requested named vector) and skips incompatible vectors.
 
 ## Code Organization Notes
 - Backend is a single `package main` file; shared logic is not split into packages yet.
@@ -60,8 +67,9 @@
 - Go style is `gofmt`-compatible with tabs and minimal abstraction.
 - Qdrant access is via handwritten structs and `encoding/json`, not an SDK.
 - Handlers call `setCORS(w)` and generally write JSON directly with `json.NewEncoder`.
-- Search filtering uses Qdrant `scroll` + `filter.should` over payload keys: `text`, `content`, `chunk_text`, `title`.
-- `/api/collections` now includes projection status fields (`projection_ready`, `projection_note`) by probing sample vectors.
+- Keyword search uses Qdrant `scroll` + `filter.should` over multiple payload keys and case variants.
+- Semantic search embeds query text via Ollama and runs Qdrant nearest-neighbor search.
+- `/api/collections` includes projection status fields (`projection_ready`, `projection_note`) by probing sample vectors.
 - Frontend clustering color key is derived from `payload.file_source` prefix (`extractClusterKey`), not from `entity_type`.
 
 ## Gotchas / Non-obvious Behaviors
@@ -70,8 +78,8 @@
   - fallback path `pca_gpu.py` from current working directory.
 - `QDRANT_API_KEY` is applied in Go HTTP client calls, but the Python worker currently receives only `qdrant_url` and does not set API key headers.
   - Result: `/api/points` can fail against API-key-protected Qdrant even if other Go-backed routes work.
-- `/api/search` comment says “GPU PCA on results”, but actual implementation uses inline Go PCA.
-- PCA coordinates are normalized server-side to `[-100, 100]`, then frontend rescales bounds again when building geometry.
+- UMAP and t-SNE projections require optional Python deps (`umap-learn`, `scikit-learn`) in runtime environment.
+- Redis cache is only active when `VECTORVIEW_REDIS_URL` is configured and ping succeeds.
 - Collection picker options are disabled when `projection_ready` is false; labels include point count, vector dim, and projection note.
 - `setCORS` sets `Access-Control-Allow-Origin: *` and `Content-Type: application/json` globally for API responses.
 

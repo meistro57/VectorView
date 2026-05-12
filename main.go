@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 )
 
 //go:embed static/*
@@ -93,6 +94,7 @@ type searchPointsRequest struct {
 	Vector         interface{} `json:"vector"`
 	Limit          int         `json:"limit"`
 	WithPayload    bool        `json:"with_payload"`
+	WithVectors    bool        `json:"with_vectors,omitempty"`
 	ScoreThreshold *float64    `json:"score_threshold,omitempty"`
 }
 
@@ -130,9 +132,12 @@ type similarResponse struct {
 // ── API response types ────────────────────────────────────────────────────────
 
 type PointsResponse struct {
-	Points     []PointData     `json:"points"`
-	Total      int             `json:"total"`
-	Projection *ProjectionMeta `json:"projection,omitempty"`
+	Points       []PointData     `json:"points"`
+	Total        int             `json:"total"`
+	Projection   *ProjectionMeta `json:"projection,omitempty"`
+	Incremental  bool            `json:"incremental,omitempty"`
+	AppendFrom   int             `json:"append_from,omitempty"`
+	CachedResult bool            `json:"cached_result,omitempty"`
 }
 
 type ProjectionMeta struct {
@@ -172,6 +177,79 @@ type loadProgress struct {
 }
 
 var pointsLoadProgress sync.Map
+
+type projectionCache interface {
+	Get(ctx context.Context, key string) (*PointsResponse, bool, error)
+	Set(ctx context.Context, key string, value *PointsResponse) error
+}
+
+type redisProjectionCache struct {
+	client *redis.Client
+	ttl    time.Duration
+}
+
+func newRedisProjectionCache(redisURL string, ttl time.Duration) (*redisProjectionCache, error) {
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid redis url: %w", err)
+	}
+	client := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("redis ping failed: %w", err)
+	}
+	return &redisProjectionCache{client: client, ttl: ttl}, nil
+}
+
+func (c *redisProjectionCache) Get(ctx context.Context, key string) (*PointsResponse, bool, error) {
+	raw, err := c.client.Get(ctx, key).Result()
+	if err == redis.Nil {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var out PointsResponse
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, false, err
+	}
+	out.CachedResult = true
+	return &out, true, nil
+}
+
+func (c *redisProjectionCache) Set(ctx context.Context, key string, value *PointsResponse) error {
+	if value == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return c.client.Set(ctx, key, encoded, c.ttl).Err()
+}
+
+func projectionCacheKey(collection string, limit int, projectionMethod, vectorName string) string {
+	vectorName = strings.TrimSpace(vectorName)
+	if vectorName == "" {
+		vectorName = "_default"
+	}
+	return fmt.Sprintf("vectorview:projection:v1:%s:%d:%s:%s", collection, limit, projectionMethod, vectorName)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 // ── Qdrant client ─────────────────────────────────────────────────────────────
 
@@ -296,6 +374,75 @@ func (q *qdrantClient) getPointByID(ctx context.Context, collection, pointID str
 	return nil, nil
 }
 
+func (q *qdrantClient) fetchPointsWindow(ctx context.Context, collection string, start, count int) ([]QPoint, error) {
+	if count <= 0 {
+		return []QPoint{}, nil
+	}
+	offset := interface{}(nil)
+	skipped := 0
+	out := make([]QPoint, 0, count)
+
+	for len(out) < count {
+		req := scrollRequest{
+			Limit:       minInt(200, max(32, count-len(out))),
+			WithPayload: true,
+			WithVectors: true,
+			Offset:      offset,
+		}
+		raw, status, err := q.do(ctx, http.MethodPost, "/collections/"+collection+"/points/scroll", req)
+		if err != nil {
+			return nil, err
+		}
+		if status >= 400 {
+			return nil, fmt.Errorf("qdrant %d: %s", status, string(raw))
+		}
+		var res scrollResult
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return nil, fmt.Errorf("decode scroll window: %w", err)
+		}
+		if res.Result == nil || len(res.Result.Points) == 0 {
+			break
+		}
+
+		points := res.Result.Points
+		if skipped+len(points) <= start {
+			skipped += len(points)
+			offset = res.Result.NextPage
+			if offset == nil {
+				break
+			}
+			continue
+		}
+
+		begin := 0
+		if start > skipped {
+			begin = start - skipped
+		}
+		for i := begin; i < len(points) && len(out) < count; i++ {
+			out = append(out, points[i])
+		}
+		skipped += len(points)
+		offset = res.Result.NextPage
+		if offset == nil {
+			break
+		}
+	}
+
+	return out, nil
+}
+
+func parseAppendFrom(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("invalid append_from: %q", raw)
+	}
+	return value, nil
+}
+
 func parseSimilarityLimit(r *http.Request, fallback int) (int, error) {
 	limit := fallback
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
@@ -355,11 +502,57 @@ func parseProjectionMethod(raw string) (string, error) {
 		method = "pca"
 	}
 	switch method {
-	case "pca", "random", "tsne":
+	case "pca", "random", "tsne", "umap":
 		return method, nil
 	default:
-		return "", fmt.Errorf("invalid projection: %q (expected pca, random, tsne)", raw)
+		return "", fmt.Errorf("invalid projection: %q (expected pca, random, tsne, umap)", raw)
 	}
+}
+
+func embedQueryWithOllama(ctx context.Context, ollamaURL, model, query string) ([]float64, error) {
+	if strings.TrimSpace(model) == "" {
+		return nil, fmt.Errorf("VECTORVIEW_EMBED_MODEL is required")
+	}
+	base := strings.TrimRight(strings.TrimSpace(ollamaURL), "/")
+	if base == "" {
+		return nil, fmt.Errorf("VECTORVIEW_OLLAMA_URL is required")
+	}
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"model": model,
+		"input": query,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal ollama payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/embed", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ollama %d: %s", resp.StatusCode, string(body))
+	}
+
+	var parsed struct {
+		Embeddings [][]float64 `json:"embeddings"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("decode ollama embed response: %w", err)
+	}
+	if len(parsed.Embeddings) == 0 || len(parsed.Embeddings[0]) == 0 {
+		return nil, fmt.Errorf("ollama embed returned no vectors")
+	}
+	return parsed.Embeddings[0], nil
 }
 
 func canonicalPointID(v interface{}) string {
@@ -382,13 +575,45 @@ func canonicalPointID(v interface{}) string {
 	}
 }
 
-func pickSearchVector(raw interface{}) (interface{}, string) {
+func pickSearchVector(raw interface{}, preferredName string) (interface{}, string) {
+	preferredName = strings.TrimSpace(preferredName)
 	if vec := toFloatSlice(raw); len(vec) > 0 {
 		return vec, ""
 	}
 	obj, ok := raw.(map[string]interface{})
 	if !ok {
 		return nil, ""
+	}
+
+	pickNamed := func(name string) (interface{}, string) {
+		if name == "" {
+			return nil, ""
+		}
+		rawValue, exists := obj[name]
+		if !exists {
+			return nil, ""
+		}
+		if vec := toFloatSlice(rawValue); len(vec) > 0 {
+			if name == "vector" {
+				return vec, ""
+			}
+			return namedSearchVector{Name: name, Vector: vec}, name
+		}
+		nested, ok := rawValue.(map[string]interface{})
+		if !ok {
+			return nil, ""
+		}
+		if vec := toFloatSlice(nested["vector"]); len(vec) > 0 {
+			if name == "vector" {
+				return vec, ""
+			}
+			return namedSearchVector{Name: name, Vector: vec}, name
+		}
+		return nil, ""
+	}
+
+	if preferred, preferredKey := pickNamed(preferredName); preferred != nil {
+		return preferred, preferredKey
 	}
 
 	keys := make([]string, 0, len(obj))
@@ -398,21 +623,8 @@ func pickSearchVector(raw interface{}) (interface{}, string) {
 	sort.Strings(keys)
 
 	for _, key := range keys {
-		if vec := toFloatSlice(obj[key]); len(vec) > 0 {
-			if key == "vector" {
-				return vec, ""
-			}
-			return namedSearchVector{Name: key, Vector: vec}, key
-		}
-		nested, ok := obj[key].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if vec := toFloatSlice(nested["vector"]); len(vec) > 0 {
-			if key == "vector" {
-				return vec, ""
-			}
-			return namedSearchVector{Name: key, Vector: vec}, key
+		if vec, vecName := pickNamed(key); vec != nil {
+			return vec, vecName
 		}
 	}
 	return nil, ""
@@ -479,7 +691,7 @@ func parseFetchProgressLine(line string) (int, int, bool) {
 }
 
 // runGPUPCA calls pca_gpu.py and returns projected points response
-func runGPUPCA(collection string, limit int, qdrantURL, projectionMethod, progressID string) (PointsResponse, error) {
+func runGPUPCA(collection string, limit int, qdrantURL, projectionMethod, vectorName, progressID string) (PointsResponse, error) {
 	py := pythonBin()
 	script := pcaScript()
 
@@ -489,12 +701,17 @@ func runGPUPCA(collection string, limit int, qdrantURL, projectionMethod, progre
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, py, script,
+	args := []string{
+		script,
 		collection,
 		strconv.Itoa(limit),
 		qdrantURL,
 		projectionMethod,
-	)
+	}
+	if strings.TrimSpace(vectorName) != "" {
+		args = append(args, vectorName)
+	}
+	cmd := exec.CommandContext(ctx, py, args...)
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -553,7 +770,7 @@ func runGPUPCA(collection string, limit int, qdrantURL, projectionMethod, progre
 	return resp, nil
 }
 
-func runProjectionOnPoints(points []QPoint, projectionMethod string) (PointsResponse, error) {
+func runProjectionOnPoints(points []QPoint, projectionMethod, vectorName string) (PointsResponse, error) {
 	py := pythonBin()
 	script := pcaScript()
 
@@ -561,7 +778,7 @@ func runProjectionOnPoints(points []QPoint, projectionMethod string) (PointsResp
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, py, script, "--stdin", projectionMethod)
-	payload, err := json.Marshal(map[string]interface{}{"points": points})
+	payload, err := json.Marshal(map[string]interface{}{"points": points, "vector_name": vectorName})
 	if err != nil {
 		return PointsResponse{}, fmt.Errorf("marshal projection payload: %w", err)
 	}
@@ -620,10 +837,29 @@ func main() {
 
 	q := newQdrant(qdrantURL, qdrantKey)
 
+	var pointsCache projectionCache
+	if redisURL := strings.TrimSpace(os.Getenv("VECTORVIEW_REDIS_URL")); redisURL != "" {
+		cacheTTLSeconds, err := strconv.Atoi(envOr("VECTORVIEW_CACHE_TTL_SECONDS", "600"))
+		if err != nil || cacheTTLSeconds <= 0 {
+			cacheTTLSeconds = 600
+		}
+		redisCache, err := newRedisProjectionCache(redisURL, time.Duration(cacheTTLSeconds)*time.Second)
+		if err != nil {
+			log.Printf("Projection cache disabled: %v", err)
+		} else {
+			pointsCache = redisCache
+			log.Printf("Projection cache enabled via Redis (%s, ttl=%ds)", redisURL, cacheTTLSeconds)
+		}
+	}
+
 	staticSub, err := fs.Sub(staticFiles, "static")
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	semanticProvider := strings.ToLower(strings.TrimSpace(envOr("VECTORVIEW_SEMANTIC_PROVIDER", "ollama")))
+	embedModel := strings.TrimSpace(envOr("VECTORVIEW_EMBED_MODEL", "nomic-embed-text"))
+	ollamaURL := strings.TrimSpace(envOr("VECTORVIEW_OLLAMA_URL", "http://localhost:11434"))
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
@@ -674,7 +910,7 @@ func main() {
 	})
 
 	// GET /api/points?collection=X&limit=N
-	// Delegates fetch+PCA to pca_gpu.py
+	// Delegates fetch+projection to pca_gpu.py and optionally serves Redis cache.
 	mux.HandleFunc("/api/points", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
 		collection := r.URL.Query().Get("collection")
@@ -687,20 +923,92 @@ func main() {
 				limit = lv
 			}
 		}
+		appendFrom, err := parseAppendFrom(r.URL.Query().Get("append_from"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if appendFrom > limit {
+			http.Error(w, "append_from cannot exceed limit", http.StatusBadRequest)
+			return
+		}
 		progressID := strings.TrimSpace(r.URL.Query().Get("progress_id"))
+		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
 		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		cacheKey := projectionCacheKey(collection, limit, projectionMethod, vectorName)
 
-		log.Printf("→ /api/points collection=%s limit=%d projection=%s", collection, limit, projectionMethod)
-		resp, err := runGPUPCA(collection, limit, qdrantURL, projectionMethod, progressID)
+		if pointsCache != nil {
+			if cached, ok, err := pointsCache.Get(r.Context(), cacheKey); err == nil && ok && cached != nil {
+				if appendFrom > 0 {
+					if appendFrom > len(cached.Points) {
+						http.Error(w, "append_from exceeds cached total", http.StatusBadRequest)
+						return
+					}
+					incremental := PointsResponse{
+						Points:       append([]PointData(nil), cached.Points[appendFrom:]...),
+						Total:        len(cached.Points),
+						Projection:   cached.Projection,
+						Incremental:  true,
+						AppendFrom:   appendFrom,
+						CachedResult: true,
+					}
+					json.NewEncoder(w).Encode(incremental)
+					return
+				}
+				json.NewEncoder(w).Encode(cached)
+				return
+			} else if err != nil {
+				log.Printf("projection cache read miss/error: %v", err)
+			}
+		}
+
+		if appendFrom > 0 && projectionMethod == "random" && pointsCache != nil {
+			baseKey := projectionCacheKey(collection, appendFrom, projectionMethod, vectorName)
+			if base, ok, err := pointsCache.Get(r.Context(), baseKey); err == nil && ok && base != nil && len(base.Points) == appendFrom {
+				deltaRaw, err := q.fetchPointsWindow(r.Context(), collection, appendFrom, limit-appendFrom)
+				if err == nil {
+					deltaResp, err := runProjectionOnPoints(deltaRaw, projectionMethod, vectorName)
+					if err == nil {
+						mergedPoints := make([]PointData, 0, len(base.Points)+len(deltaResp.Points))
+						mergedPoints = append(mergedPoints, base.Points...)
+						mergedPoints = append(mergedPoints, deltaResp.Points...)
+						merged := &PointsResponse{Points: mergedPoints, Total: len(mergedPoints), Projection: deltaResp.Projection}
+						if err := pointsCache.Set(r.Context(), cacheKey, merged); err != nil {
+							log.Printf("projection cache write error: %v", err)
+						}
+						incremental := PointsResponse{
+							Points:      append([]PointData(nil), deltaResp.Points...),
+							Total:       len(mergedPoints),
+							Projection:  deltaResp.Projection,
+							Incremental: true,
+							AppendFrom:  appendFrom,
+						}
+						json.NewEncoder(w).Encode(incremental)
+						return
+					}
+					log.Printf("incremental projection fallback (worker): %v", err)
+				} else {
+					log.Printf("incremental projection fallback (fetch): %v", err)
+				}
+			}
+		}
+
+		log.Printf("→ /api/points collection=%s limit=%d projection=%s vector=%q", collection, limit, projectionMethod, vectorName)
+		resp, err := runGPUPCA(collection, limit, qdrantURL, projectionMethod, vectorName, progressID)
 		if err != nil {
 			setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
 			log.Printf("ERROR runGPUPCA: %v", err)
 			http.Error(w, err.Error(), 500)
 			return
+		}
+		if pointsCache != nil {
+			if err := pointsCache.Set(r.Context(), cacheKey, &resp); err != nil {
+				log.Printf("projection cache write error: %v", err)
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -725,6 +1033,7 @@ func main() {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
 
 		type matchValue struct {
 			Text string `json:"text"`
@@ -781,10 +1090,91 @@ func main() {
 			pts = res.Result.Points
 		}
 
-		resp, err := runProjectionOnPoints(pts, projectionMethod)
+		resp, err := runProjectionOnPoints(pts, projectionMethod, vectorName)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("projection failed: %v", err), http.StatusInternalServerError)
 			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// GET /api/semantic-search?collection=X&target_collection=Y&q=query&limit=N
+	// Embed query text and run nearest-neighbor search in same or target collection.
+	mux.HandleFunc("/api/semantic-search", func(w http.ResponseWriter, r *http.Request) {
+		setCORS(w)
+		sourceCollection := strings.TrimSpace(r.URL.Query().Get("collection"))
+		if sourceCollection == "" {
+			sourceCollection = "meistro_brain"
+		}
+		targetCollection := strings.TrimSpace(r.URL.Query().Get("target_collection"))
+		if targetCollection == "" {
+			targetCollection = sourceCollection
+		}
+		queryStr := strings.TrimSpace(r.URL.Query().Get("q"))
+		if queryStr == "" {
+			http.Error(w, "q is required", http.StatusBadRequest)
+			return
+		}
+		limit := 120
+		if lv, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && lv > 0 {
+			limit = lv
+		}
+		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
+
+		var embedding []float64
+		switch semanticProvider {
+		case "ollama", "":
+			embedding, err = embedQueryWithOllama(r.Context(), ollamaURL, embedModel, queryStr)
+		default:
+			http.Error(w, fmt.Sprintf("unsupported semantic provider: %s", semanticProvider), http.StatusBadRequest)
+			return
+		}
+		if err != nil {
+			http.Error(w, fmt.Sprintf("embedding failed: %v", err), http.StatusBadGateway)
+			return
+		}
+
+		queryVector := interface{}(embedding)
+		if vectorName != "" {
+			queryVector = namedSearchVector{Name: vectorName, Vector: embedding}
+		}
+		sreq := searchPointsRequest{
+			Vector:      queryVector,
+			Limit:       limit,
+			WithPayload: true,
+			WithVectors: true,
+		}
+		raw, status, err := q.do(r.Context(), http.MethodPost,
+			"/collections/"+targetCollection+"/points/search", sreq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if status >= 400 {
+			http.Error(w, fmt.Sprintf("qdrant %d: %s", status, string(raw)), http.StatusInternalServerError)
+			return
+		}
+
+		var searchRes struct {
+			Result []QPoint `json:"result"`
+		}
+		if err := json.Unmarshal(raw, &searchRes); err != nil {
+			http.Error(w, fmt.Sprintf("decode semantic search: %v", err), http.StatusInternalServerError)
+			return
+		}
+		resp, err := runProjectionOnPoints(searchRes.Result, projectionMethod, vectorName)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("projection failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if sourceCollection != targetCollection {
+			log.Printf("cross-collection semantic search: source=%s target=%s q=%q hits=%d", sourceCollection, targetCollection, queryStr, len(resp.Points))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -820,7 +1210,8 @@ func main() {
 			return
 		}
 
-		searchVector, vectorName := pickSearchVector(selected.Vector)
+		queryVectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
+		searchVector, vectorName := pickSearchVector(selected.Vector, queryVectorName)
 		if searchVector == nil {
 			http.Error(w, "selected point has no usable vector", http.StatusBadRequest)
 			return
@@ -907,7 +1298,8 @@ func main() {
 			return
 		}
 
-		searchVector, vectorName := pickSearchVector(selected.Vector)
+		queryVectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
+		searchVector, vectorName := pickSearchVector(selected.Vector, queryVectorName)
 		if searchVector == nil {
 			http.Error(w, "selected point has no usable vector", http.StatusBadRequest)
 			return

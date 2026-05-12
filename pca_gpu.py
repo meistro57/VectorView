@@ -121,7 +121,7 @@ def pca_gpu(matrix):
     return coords
 
 
-def vector_candidates(raw_vector):
+def vector_candidates(raw_vector, preferred_name=None):
     if isinstance(raw_vector, list):
         return [raw_vector]
     if not isinstance(raw_vector, dict):
@@ -129,9 +129,13 @@ def vector_candidates(raw_vector):
 
     keys = sorted(raw_vector.keys())
     ordered_keys = []
-    if "vector" in raw_vector:
+
+    preferred_key = str(preferred_name or "").strip()
+    if preferred_key and preferred_key in raw_vector:
+        ordered_keys.append(preferred_key)
+    if "vector" in raw_vector and "vector" not in ordered_keys:
         ordered_keys.append("vector")
-    ordered_keys.extend([k for k in keys if k != "vector"])
+    ordered_keys.extend([k for k in keys if k not in ordered_keys])
 
     candidates = []
     for key in ordered_keys:
@@ -146,11 +150,11 @@ def vector_candidates(raw_vector):
     return candidates
 
 
-def choose_projection_dim(points):
+def choose_projection_dim(points, vector_name=None):
     dim_counts = {}
     for p in points:
         seen_dims = set()
-        for vec in vector_candidates(p.get("vector")):
+        for vec in vector_candidates(p.get("vector"), vector_name):
             dim = len(vec)
             if dim <= 0 or dim in seen_dims:
                 continue
@@ -161,8 +165,8 @@ def choose_projection_dim(points):
     return max(dim_counts.items(), key=lambda item: (item[1], item[0]))[0]
 
 
-def extract_dense_vector(raw_vector, target_dim=None):
-    for vec in vector_candidates(raw_vector):
+def extract_dense_vector(raw_vector, target_dim=None, vector_name=None):
+    for vec in vector_candidates(raw_vector, vector_name):
         if target_dim is None or len(vec) == target_dim:
             return vec
     return None
@@ -172,8 +176,8 @@ def validate_projection_method(raw):
     method = str(raw or "").strip().lower()
     if not method:
         method = "pca"
-    if method not in {"pca", "random", "tsne"}:
-        raise ValueError(f"invalid projection: {raw!r} (expected pca, random, tsne)")
+    if method not in {"pca", "random", "tsne", "umap"}:
+        raise ValueError(f"invalid projection: {raw!r} (expected pca, random, tsne, umap)")
     return method
 
 
@@ -188,22 +192,25 @@ def ensure_three_axes(coords):
     return coords
 
 
-def random_projection(centered_matrix):
-    dim = centered_matrix.shape[1]
+def random_projection(matrix):
+    dim = matrix.shape[1]
     rng = np.random.default_rng(42)
     basis = rng.standard_normal((dim, 3)).astype(np.float32)
     basis_norm = np.linalg.norm(basis, axis=0, keepdims=True)
     basis_norm[basis_norm < 1e-8] = 1.0
     basis /= basis_norm
-    return centered_matrix @ basis
+
+    row_norm = np.linalg.norm(matrix, axis=1, keepdims=True)
+    row_norm[row_norm < 1e-8] = 1.0
+    normalized = matrix / row_norm
+    return normalized @ basis
 
 
 def tsne_projection(matrix):
     n = matrix.shape[0]
     if n <= 3:
         log("t-SNE needs at least 4 points for stable perplexity; using random projection")
-        centered = matrix - matrix.mean(axis=0, keepdims=True)
-        return random_projection(centered)
+        return random_projection(matrix)
 
     try:
         from sklearn.manifold import TSNE
@@ -219,6 +226,28 @@ def tsne_projection(matrix):
         perplexity=perplexity,
     )
     return tsne.fit_transform(matrix)
+
+
+def umap_projection(matrix):
+    n = matrix.shape[0]
+    if n <= 3:
+        log("UMAP needs at least 4 points for stable neighborhoods; using random projection")
+        return random_projection(matrix)
+
+    try:
+        import umap
+    except ImportError as exc:
+        raise RuntimeError("UMAP projection requires umap-learn installed in Python env") from exc
+
+    neighbors = int(min(32, max(4, n // 12)))
+    model = umap.UMAP(
+        n_components=3,
+        n_neighbors=neighbors,
+        min_dist=0.08,
+        metric="cosine",
+        random_state=42,
+    )
+    return model.fit_transform(matrix)
 
 
 def build_projection_meta(method, centered_matrix, projected_coords):
@@ -268,19 +297,27 @@ def normalize_coords(coords):
     return coords
 
 
-def project_points(raw_points, projection_method):
+def normalize_random_coords(coords):
+    coords = ensure_three_axes(coords)
+    return np.tanh(coords * 6.0) * 100.0
+
+
+def project_points(raw_points, projection_method, vector_name=None):
     if not raw_points:
         return {"points": [], "total": 0, "projection": None}
 
-    target_dim = choose_projection_dim(raw_points)
+    target_dim = choose_projection_dim(raw_points, vector_name)
     if target_dim <= 0:
-        log("Skipped all points: no dense vectors found")
+        if vector_name:
+            log(f"Skipped all points: no dense vectors found for vector_name={vector_name!r}")
+        else:
+            log("Skipped all points: no dense vectors found")
         return {"points": [], "total": 0, "projection": None}
 
     valid = []
     skipped = 0
     for p in raw_points:
-        vec = extract_dense_vector(p.get("vector"), target_dim)
+        vec = extract_dense_vector(p.get("vector"), target_dim, vector_name)
         if not vec:
             skipped += 1
             continue
@@ -303,16 +340,22 @@ def project_points(raw_points, projection_method):
     if projection_method == "pca":
         coords = pca_gpu(matrix)
     elif projection_method == "random":
-        coords = random_projection(centered)
+        coords = random_projection(matrix)
         log("Random projection complete")
-    else:
+    elif projection_method == "tsne":
         coords = tsne_projection(matrix)
         log("t-SNE projection complete")
+    else:
+        coords = umap_projection(matrix)
+        log("UMAP projection complete")
     log(f"Projection done in {time.time()-t1:.1f}s")
 
     coords = ensure_three_axes(coords)
     projection_meta = build_projection_meta(projection_method, centered, coords)
-    coords = normalize_coords(coords)
+    if projection_method == "random":
+        coords = normalize_random_coords(coords)
+    else:
+        coords = normalize_coords(coords)
 
     out = []
     for i, p in enumerate(points):
@@ -338,25 +381,27 @@ def main():
             raw_points = payload.get("points") if isinstance(payload, dict) else None
             if not isinstance(raw_points, list):
                 raise ValueError("stdin payload must be object with points array")
-            result = project_points(raw_points, projection_method)
+            vector_name = str(payload.get("vector_name") or "").strip() if isinstance(payload, dict) else ""
+            result = project_points(raw_points, projection_method, vector_name)
             print(json.dumps(result))
             return
 
         if len(sys.argv) < 4:
-            print(json.dumps({"error": "usage: pca_gpu.py <collection> <limit> <qdrant_url> [projection]"}))
+            print(json.dumps({"error": "usage: pca_gpu.py <collection> <limit> <qdrant_url> [projection] [vector_name]"}))
             sys.exit(1)
 
         collection = sys.argv[1]
         limit = int(sys.argv[2])
         qdrant_url = sys.argv[3].rstrip("/")
         projection_method = validate_projection_method(sys.argv[4] if len(sys.argv) >= 5 else "pca")
+        vector_name = str(sys.argv[5]).strip() if len(sys.argv) >= 6 else ""
 
         t0 = time.time()
         log(f"Fetching {limit} points from {collection} @ {qdrant_url}")
         raw_points = fetch_points(collection, limit, qdrant_url)
         log(f"Fetch done in {time.time()-t0:.1f}s — {len(raw_points)} points")
 
-        result = project_points(raw_points, projection_method)
+        result = project_points(raw_points, projection_method, vector_name)
         log(f"Total time: {time.time()-t0:.1f}s")
         print(json.dumps(result))
     except Exception as exc:
