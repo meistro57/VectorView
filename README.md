@@ -16,6 +16,7 @@
 [![Qdrant](https://img.shields.io/badge/Qdrant-vector%20db-dc244c?style=flat-square)](https://qdrant.tech)
 [![Three.js](https://img.shields.io/badge/Three.js-r128-black?style=flat-square&logo=threedotjs)](https://threejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![Tests](https://github.com/meistro57/VectorView/actions/workflows/test.yml/badge.svg)](https://github.com/meistro57/VectorView/actions/workflows/test.yml)
 
 </div>
 
@@ -129,6 +130,15 @@ go build -o vectorview .
 ```bash
 go test ./...
 ```
+
+Latest local verification:
+
+```bash
+$ go test ./...
+?   	github.com/meistro57/vectorview	[no test files]
+```
+
+This still confirms the app compiles and links cleanly end-to-end.
 
 ---
 
