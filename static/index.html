@@ -774,6 +774,26 @@
   </div>
 
   <div class="ctrl-row">
+    <label>Color By</label>
+    <select id="ctrl-color-field">
+      <option value="source" selected>Source (default)</option>
+      <option value="ai_provider">AI Provider (claude/gpt)</option>
+      <option value="ai_model">AI Model</option>
+      <option value="speaker">Speaker (user/assistant)</option>
+      <option value="awakening_phase">Awakening Phase</option>
+      <option value="memory_kind">Memory Kind</option>
+      <option value="project">Project</option>
+      <option value="source_type">Source Type</option>
+      <option value="custom">Custom field…</option>
+    </select>
+  </div>
+
+  <div class="ctrl-row" id="row-color-field-custom" style="display:none;">
+    <label>Custom Color Field</label>
+    <input type="text" id="ctrl-color-field-custom" placeholder="payload key name">
+  </div>
+
+  <div class="ctrl-row">
     <label>Size Field</label>
     <select id="ctrl-size-field">
       <option value="none" selected>None</option>
@@ -846,6 +866,10 @@
 
   <div class="panel-title">⬡ Legend</div>
   <div class="color-legend" id="legend"></div>
+
+  <div class="panel-title">⬡ Outliers <span id="val-outlier-count" style="color:var(--dim);font-size:0.65rem;">(0)</span></div>
+  <button id="btn-outliers-only" class="scan-btn" style="width:100%;">ISOLATE OUTLIERS</button>
+  <div id="outliers-list" style="display:flex;flex-direction:column;gap:8px;margin-top:8px;max-height:280px;overflow-y:auto;"></div>
 
   <div class="panel-title">⬡ Collection Meta</div>
   <div class="meta-grid" id="collection-meta">
@@ -1066,6 +1090,8 @@ let selectedVectorName = '';
 let pointLimit = 2000;
 let pointSize = 6.0;
 let sizeField = 'none';
+let colorField = 'source';
+let colorFieldCustom = '';
 let coreOpacity = 0.85;
 let hazeOpacity = 0.55;
 let bloomStrength = 2.5;
@@ -1083,6 +1109,7 @@ let pointIndexByID = new Map();
 let collectionMetaByName = new Map();
 let outlierFlags = null;
 let outlierCount = 0;
+let outliersOnly = false;
 let basePointColors = null;
 let basePointSizes = null;
 let selectedPoint = null;
@@ -1564,6 +1591,34 @@ function refreshPointColors() {
   if (activeClusterMap) buildLegend(activeClusterMap);
 }
 
+function recolorByField(field) {
+  colorField = field;
+  if (!particleSystem || !allPoints || allPoints.length === 0) return;
+
+  const clusterMap = new Map();
+  let clusterIdx = 0;
+  for (const p of allPoints) {
+    const key = extractClusterKey(p, colorField);
+    if (!clusterMap.has(key)) {
+      clusterMap.set(key, { index: clusterIdx++, count: 0 });
+    }
+    clusterMap.get(key).count++;
+  }
+
+  pointClusterIndices = new Array(allPoints.length);
+  for (let i = 0; i < allPoints.length; i++) {
+    const key = extractClusterKey(allPoints[i], colorField);
+    pointClusterIndices[i] = clusterMap.get(key).index % activePalette.length;
+  }
+
+  activeClusterMap = clusterMap;
+  refreshPointColors();
+
+  if (particleSystem.geometry?.attributes?.position) {
+    rebuildClusterHulls(allPoints, particleSystem.geometry.attributes.position.array, activeClusterMap);
+  }
+}
+
 function setTimelineReveal(value) {
   timelineReveal = Math.max(0, Math.min(1, value));
   const percent = Math.round(timelineReveal * 100);
@@ -1587,6 +1642,11 @@ function setTimelineReveal(value) {
 function refreshPointSizes() {
   if (!particleSystem || !allPoints || allPoints.length === 0) return;
   const nextSizes = createPointSizeArray(allPoints, pointSize);
+  if (outliersOnly && outlierFlags && outlierFlags.length === nextSizes.length) {
+    for (let i = 0; i < nextSizes.length; i++) {
+      if (!outlierFlags[i]) nextSizes[i] = 0;
+    }
+  }
   basePointSizes = nextSizes;
   const sizeAttr = particleSystem.geometry.attributes.size;
   if (!sizeAttr) return;
@@ -1596,6 +1656,59 @@ function refreshPointSizes() {
   } else {
     sizeAttr.array.set(nextSizes);
     sizeAttr.needsUpdate = true;
+  }
+}
+
+function toggleOutliersOnly() {
+  outliersOnly = !outliersOnly;
+  const btn = document.getElementById('btn-outliers-only');
+  if (btn) btn.textContent = outliersOnly ? 'SHOW ALL POINTS' : 'ISOLATE OUTLIERS';
+  refreshPointSizes();
+}
+
+function renderOutliersList() {
+  const list = document.getElementById('outliers-list');
+  const countEl = document.getElementById('val-outlier-count');
+  if (!list) return;
+  list.innerHTML = '';
+  if (countEl) countEl.textContent = `(${outlierCount})`;
+
+  if (!outlierFlags || outlierCount === 0 || !allPoints || allPoints.length === 0) {
+    list.innerHTML = '<div style="color:var(--dim);font-size:0.65rem;">No outliers detected in this sample.</div>';
+    return;
+  }
+
+  let shown = 0;
+  const maxShown = 40;
+  for (let i = 0; i < allPoints.length && shown < maxShown; i++) {
+    if (!outlierFlags[i]) continue;
+    const point = allPoints[i];
+    const payload = point.payload || {};
+    const title = shortText(getSignalTitle(payload, point.id), 70);
+    const snippet = shortText(getSignalSnippet(payload), 100);
+    const provider = payloadLookup(payload, 'ai_provider') || 'unknown';
+    const speaker = payloadLookup(payload, 'speaker') || '';
+
+    const item = document.createElement('div');
+    item.className = 'similar-item';
+    item.innerHTML = `
+      <div class="similar-rank">${escapeHTML(String(provider))}${speaker ? ' · ' + escapeHTML(String(speaker)) : ''}</div>
+      <div class="similar-title">${escapeHTML(title)}</div>
+      <div class="similar-snippet">${escapeHTML(snippet)}</div>
+    `;
+    item.addEventListener('click', () => {
+      selectPointByIndex(i);
+      focusPointByIndex(i, true);
+    });
+    list.appendChild(item);
+    shown++;
+  }
+
+  if (outlierCount > shown) {
+    const more = document.createElement('div');
+    more.style.cssText = 'color:var(--dim);font-size:0.6rem;text-align:center;';
+    more.textContent = `…${outlierCount - shown} more not shown`;
+    list.appendChild(more);
   }
 }
 
@@ -2167,14 +2280,22 @@ function onClick(e) {
 }
 
 // ── Build particle cloud ──────────────────────────────────────────────────────
-function extractClusterKey(point) {
-  const sourceValue = payloadLookup(point.payload, 'file_source', 'source_id', 'source_collection', 'source_file', 'source');
-  const source = sourceValue === undefined ? '' : String(sourceValue);
-  if (!source) return 'unknown';
-  const prefix = source.split('_')[0];
-  const match = prefix.match(/^(\d+)/);
-  if (match) return match[1];
-  return prefix || source || 'unknown';
+function extractClusterKey(point, field = colorField) {
+  if (field === 'source') {
+    const sourceValue = payloadLookup(point.payload, 'file_source', 'source_id', 'source_collection', 'source_file', 'source');
+    const source = sourceValue === undefined ? '' : String(sourceValue);
+    if (!source) return 'unknown';
+    const prefix = source.split('_')[0];
+    const match = prefix.match(/^(\d+)/);
+    if (match) return match[1];
+    return prefix || source || 'unknown';
+  }
+
+  const lookupKey = field === 'custom' ? (colorFieldCustom || '').trim() : field;
+  if (!lookupKey) return 'unknown';
+  const raw = payloadLookup(point.payload, lookupKey);
+  if (raw === undefined || raw === null || raw === '') return 'unknown';
+  return String(raw);
 }
 
 function buildParticles(points, projectionMeta = null) {
@@ -2239,6 +2360,7 @@ function buildParticles(points, projectionMeta = null) {
   outlierFlags = outlierResult.flags;
   outlierCount = outlierResult.count;
   applyOutlierColors(colors);
+  renderOutliersList();
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -3422,6 +3544,23 @@ function wireControls() {
     pointSize = v;
     document.getElementById('val-size').textContent = v.toFixed(1);
     refreshPointSizes();
+  });
+
+  const outliersOnlyBtn = document.getElementById('btn-outliers-only');
+  if (outliersOnlyBtn) outliersOnlyBtn.addEventListener('click', toggleOutliersOnly);
+
+  const colorFieldCtrl = document.getElementById('ctrl-color-field');
+  const colorFieldCustomRow = document.getElementById('row-color-field-custom');
+  const colorFieldCustomCtrl = document.getElementById('ctrl-color-field-custom');
+  colorFieldCtrl.addEventListener('change', e => {
+    const value = e.target.value;
+    colorFieldCustomRow.style.display = value === 'custom' ? '' : 'none';
+    if (value === 'custom' && !colorFieldCustom.trim()) return;
+    recolorByField(value);
+  });
+  colorFieldCustomCtrl.addEventListener('change', e => {
+    colorFieldCustom = e.target.value.trim();
+    if (colorFieldCtrl.value === 'custom') recolorByField('custom');
   });
 
   const sizeFieldCtrl = document.getElementById('ctrl-size-field');

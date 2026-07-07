@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Outliers panel: lists every point flagged as a spatial-density outlier (title, snippet, ai_provider/speaker), click-to-inspect-and-focus, plus an "Isolate Outliers" toggle that hides all non-outlier points in the cloud.
+- "Color By" payload-field coloring: points can now be categorically colored by `ai_provider`, `ai_model`, `speaker`, `awakening_phase`, `memory_kind`, `project`, `source_type`, or any custom payload key, in addition to the original source-derived clustering (`extractClusterKey` generalized, `recolorByField()` recolors + rebuilds hulls/legend in-place without a refetch).
 - UMAP projection mode in both backend and frontend projection selectors (`pca` / `random` / `tsne` / `umap`).
 - Named vector selection support end-to-end (`vector_name`) across `/api/points`, `/api/search`, semantic search, and similarity scans.
 - Redis-backed projection response caching for `/api/points` via `VECTORVIEW_REDIS_URL` + `VECTORVIEW_CACHE_TTL_SECONDS`.

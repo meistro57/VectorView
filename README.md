@@ -39,13 +39,13 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Live 3D particle cloud rendered via custom WebGL shaders — additive blending, pulsing glow, dual-layer bloom
 - Unified projection pipeline: both `/api/points` and `/api/search` use `pca_gpu.py` (PyTorch/CuPy/NumPy) with selectable `pca`, `random`, `tsne`, or `umap` modes
 - Projection auto-selects the dominant dense vector dimension and skips incompatible vectors, then returns per-axis variance metadata for HUD readout
-- Color-coded clusters derived from source payload keys (`file_source`, `source_id`, `source_collection`, `source_file`, `source`) with lowercase/UPPERCASE compatibility
+- Color-coded clusters, colorable by payload field via **Color By** (`ai_provider`, `ai_model`, `speaker`, `awakening_phase`, `memory_kind`, `project`, `source_type`, or any custom key) or the original source-derived clustering (`file_source`, `source_id`, `source_collection`, `source_file`, `source`) with lowercase/UPPERCASE compatibility — recolors and rebuilds hulls/legend instantly without a refetch
 - Exponential fog, starfield background, and a subtle grid anchor the scene in deep space
 - Cluster convex hull overlays (translucent + wireframe) for dominant visible clusters
 - Density-aware fog tuning updates per load to emphasize sparse vs dense structures
 - Particle trail compositor (off-screen ping-pong textures) for ghosted motion during navigation
 - Cluster distance matrix heatmap in the HUD (top clusters by centroid distance)
-- Outlier detection marks sparse low-density points in a distinct color
+- Outlier detection marks sparse low-density points in a distinct color, with a dedicated **Outliers panel** (click-to-inspect-and-focus list) and an **Isolate Outliers** toggle that hides every other point in the cloud
 - Friendly error overlay when Qdrant is unreachable
 
 **Exploration**
@@ -215,6 +215,8 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | RADIUS SCAN | Highlight all neighbors above selected cosine threshold |
 | CLEAR SCAN | Exit highlight mode and restore normal cloud |
 | Point Count slider | Reload cloud with selected sample size (500–75,000) |
+| Color By selector | Recolor cloud by any payload field (`ai_provider`, `speaker`, custom key, etc.) without reloading |
+| Isolate Outliers button | Hide every non-outlier point to inspect the sparse-density stragglers alone |
 | Hue / Saturation / Lightness | Live palette remapping without reloading |
 | Hover particle | Quick preview (when no pinned signal) |
 | Search + SCAN | Filter to matching points |
@@ -237,6 +239,10 @@ VectorView uses a **unified projection pipeline**:
 4. **Redis caching + incremental append** — when `VECTORVIEW_REDIS_URL` is set, `/api/points` responses are cached by collection + limit + projection + vector name. Random projection loads can request `append_from=N` to add only newly requested points without recomputing the existing projected subset.
 
 The result: semantically similar points cluster together in 3D space. The geometry you see **is** the structure of your knowledge base.
+
+### Outlier detection
+
+Outliers are **spatial-density outliers in the projected 3D space**, not a payload flag — nothing in Qdrant marks a point as an outlier. On every load, the frontend bins the current point cloud's projected positions into a 3D voxel grid, computes a local density per voxel neighborhood, and flags roughly the bottom ~6% least-dense points (with an adaptive cap so tight clusters don't get over-flagged). In practice this surfaces memory chunks whose embeddings sit unusually far from the rest of the loaded sample — rare topics, one-off conversations, or content with little semantic overlap with anything else currently in view. Because it's computed client-side from the loaded sample, the flagged set can shift between loads (different point count, different projection method, different collection).
 
 ---
 
