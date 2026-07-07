@@ -368,6 +368,10 @@ var pointsLoadProgress sync.Map
 var highlightEvents sync.Map
 var wsUpgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
+// defaultCollection is the fallback when a request doesn't specify ?collection=.
+// Change this in one spot rather than chasing fallbacks across handlers.
+const defaultCollection = "meta_reflections"
+
 type projectionCache interface {
 	Get(ctx context.Context, key string) (*PointsResponse, bool, error)
 	Set(ctx context.Context, key string, value *PointsResponse) error
@@ -882,6 +886,21 @@ func setLoadProgress(progressID string, progress loadProgress) {
 	pointsLoadProgress.Store(progressID, progress)
 }
 
+// loadProgressRetention is how long a finished progress entry lingers so the
+// frontend can poll its terminal state before it gets swept from the map.
+const loadProgressRetention = 30 * time.Second
+
+// clearLoadProgressLater schedules deletion of a progress entry. Without this,
+// pointsLoadProgress grows by one entry per /api/points request and never shrinks.
+func clearLoadProgressLater(progressID string) {
+	if progressID == "" {
+		return
+	}
+	time.AfterFunc(loadProgressRetention, func() {
+		pointsLoadProgress.Delete(progressID)
+	})
+}
+
 func parseFetchProgressLine(line string) (int, int, bool) {
 	idx := strings.Index(line, "Fetched ")
 	if idx == -1 {
@@ -996,14 +1015,16 @@ func startRedisTelemetryBridge(ctx context.Context, redisURL, channel string, hu
 }
 
 // runGPUPCA calls pca_gpu.py and returns projected points response
-func runGPUPCA(collection string, limit int, qdrantURL, projectionMethod, vectorName, progressID string) (PointsResponse, error) {
+func runGPUPCA(parent context.Context, collection string, limit int, qdrantURL, projectionMethod, vectorName, progressID string) (PointsResponse, error) {
 	py := pythonBin()
 	script := pcaScript()
 
 	log.Printf("GPU PCA: %s %s %s %d %s", py, script, collection, limit, qdrantURL)
 	setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "starting", Done: false})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Derive from the request context so a client disconnect cancels the
+	// subprocess instead of letting it run for the full timeout.
+	ctx, cancel := context.WithTimeout(parent, 10*time.Minute)
 	defer cancel()
 
 	args := []string{
@@ -1075,11 +1096,12 @@ func runGPUPCA(collection string, limit int, qdrantURL, projectionMethod, vector
 	return resp, nil
 }
 
-func runProjectionOnPoints(points []QPoint, projectionMethod, vectorName string) (PointsResponse, error) {
+func runProjectionOnPoints(parent context.Context, points []QPoint, projectionMethod, vectorName string) (PointsResponse, error) {
 	py := pythonBin()
 	script := pcaScript()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Derive from the request context so a client disconnect cancels the worker.
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, py, script, "--stdin", projectionMethod)
@@ -1416,7 +1438,7 @@ func main() {
 			}
 			collection := strings.TrimSpace(req.Collection)
 			if collection == "" {
-				collection = "meistro_brain"
+				collection = defaultCollection
 			}
 			ids := make([]interface{}, 0, len(req.IDs))
 			for _, id := range req.IDs {
@@ -1446,7 +1468,7 @@ func main() {
 		case http.MethodGet:
 			collection := strings.TrimSpace(r.URL.Query().Get("collection"))
 			if collection == "" {
-				collection = "meistro_brain"
+				collection = defaultCollection
 			}
 			since := strings.TrimSpace(r.URL.Query().Get("since"))
 			value, ok := highlightEvents.Load(collection)
@@ -1476,7 +1498,7 @@ func main() {
 		setCORS(w)
 		collection := r.URL.Query().Get("collection")
 		if collection == "" {
-			collection = "meistro_brain"
+			collection = defaultCollection
 		}
 		limit := maxPoints
 		if ls := r.URL.Query().Get("limit"); ls != "" {
@@ -1494,6 +1516,7 @@ func main() {
 			return
 		}
 		progressID := strings.TrimSpace(r.URL.Query().Get("progress_id"))
+		defer clearLoadProgressLater(progressID)
 		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
 		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
 		if err != nil {
@@ -1532,7 +1555,7 @@ func main() {
 			if base, ok, err := pointsCache.Get(r.Context(), baseKey); err == nil && ok && base != nil && len(base.Points) == appendFrom {
 				deltaRaw, err := q.fetchPointsWindow(r.Context(), collection, appendFrom, limit-appendFrom)
 				if err == nil {
-					deltaResp, err := runProjectionOnPoints(deltaRaw, projectionMethod, vectorName)
+					deltaResp, err := runProjectionOnPoints(r.Context(), deltaRaw, projectionMethod, vectorName)
 					if err == nil {
 						mergedPoints := make([]PointData, 0, len(base.Points)+len(deltaResp.Points))
 						mergedPoints = append(mergedPoints, base.Points...)
@@ -1559,7 +1582,7 @@ func main() {
 		}
 
 		log.Printf("→ /api/points collection=%s limit=%d projection=%s vector=%q", collection, limit, projectionMethod, vectorName)
-		resp, err := runGPUPCA(collection, limit, qdrantURL, projectionMethod, vectorName, progressID)
+		resp, err := runGPUPCA(r.Context(), collection, limit, qdrantURL, projectionMethod, vectorName, progressID)
 		if err != nil {
 			setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
 			log.Printf("ERROR runGPUPCA: %v", err)
@@ -1582,7 +1605,7 @@ func main() {
 		setCORS(w)
 		collection := r.URL.Query().Get("collection")
 		if collection == "" {
-			collection = "meistro_brain"
+			collection = defaultCollection
 		}
 		queryStr := r.URL.Query().Get("q")
 		limit := 500
@@ -1651,7 +1674,7 @@ func main() {
 			pts = res.Result.Points
 		}
 
-		resp, err := runProjectionOnPoints(pts, projectionMethod, vectorName)
+		resp, err := runProjectionOnPoints(r.Context(), pts, projectionMethod, vectorName)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("projection failed: %v", err), http.StatusInternalServerError)
 			return
@@ -1666,7 +1689,7 @@ func main() {
 		setCORS(w)
 		sourceCollection := strings.TrimSpace(r.URL.Query().Get("collection"))
 		if sourceCollection == "" {
-			sourceCollection = "meistro_brain"
+			sourceCollection = defaultCollection
 		}
 		targetCollection := strings.TrimSpace(r.URL.Query().Get("target_collection"))
 		if targetCollection == "" {
@@ -1729,7 +1752,7 @@ func main() {
 			http.Error(w, fmt.Sprintf("decode semantic search: %v", err), http.StatusInternalServerError)
 			return
 		}
-		resp, err := runProjectionOnPoints(searchRes.Result, projectionMethod, vectorName)
+		resp, err := runProjectionOnPoints(r.Context(), searchRes.Result, projectionMethod, vectorName)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("projection failed: %v", err), http.StatusInternalServerError)
 			return

@@ -240,6 +240,34 @@ def umap_projection(matrix):
         raise RuntimeError("UMAP projection requires umap-learn installed in Python env") from exc
 
     neighbors = int(min(32, max(4, n // 12)))
+
+    # pynndescent (UMAP's default neighbor search) forces single-threaded search
+    # whenever random_state is fixed, since parallel randomized search isn't
+    # reproducible. We sidestep that entirely by precomputing an exact cosine
+    # k-NN graph on GPU (deterministic, no randomized algorithm involved) and
+    # handing it to UMAP directly, so only the (cheaper) embedding step runs
+    # single-threaded — the expensive neighbor search runs fully parallel on GPU.
+    precomputed_knn = None
+    try:
+        precomputed_knn = gpu_exact_knn(matrix, neighbors)
+    except Exception as exc:
+        log(f"GPU k-NN precompute failed ({exc}); falling back to standard UMAP neighbor search")
+
+    if precomputed_knn is not None:
+        knn_indices, knn_dists = precomputed_knn
+        try:
+            model = umap.UMAP(
+                n_components=3,
+                n_neighbors=neighbors,
+                min_dist=0.08,
+                metric="cosine",
+                random_state=42,
+                precomputed_knn=(knn_indices, knn_dists),
+            )
+            return model.fit_transform(matrix)
+        except TypeError:
+            log("Installed umap-learn is too old for precomputed_knn; falling back to standard UMAP")
+
     model = umap.UMAP(
         n_components=3,
         n_neighbors=neighbors,
@@ -248,6 +276,48 @@ def umap_projection(matrix):
         random_state=42,
     )
     return model.fit_transform(matrix)
+
+
+def gpu_exact_knn(matrix, k):
+    """Compute an exact cosine k-NN graph on GPU via batched matmul + topk.
+
+    Fully deterministic (plain linear algebra, no randomized search), which is
+    what lets UMAP take random_state=42 without also being forced onto a
+    single CPU thread for neighbor search. Returns None if CUDA isn't
+    available so callers can fall back to UMAP's own (CPU) neighbor search.
+    """
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+
+    device = torch.device("cuda")
+    t = torch.tensor(matrix, dtype=torch.float32, device=device)
+    norms = t.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    t_norm = t / norms
+    n = t.shape[0]
+    batch_size = 2000
+
+    knn_idx = torch.empty((n, k), dtype=torch.long, device=device)
+    knn_dist = torch.empty((n, k), dtype=torch.float32, device=device)
+
+    log(f"Computing exact GPU k-NN graph (k={k}) for UMAP...")
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        sims = t_norm[start:end] @ t_norm.T
+        row_idx = torch.arange(end - start, device=device)
+        col_idx = torch.arange(start, end, device=device)
+        sims[row_idx, col_idx] = -1e9  # exclude self-match
+        topk_sims, topk_idx = torch.topk(sims, k, dim=1, largest=True)
+        knn_idx[start:end] = topk_idx
+        knn_dist[start:end] = 1.0 - topk_sims
+        del sims
+
+    torch.cuda.empty_cache()
+    log("GPU k-NN graph complete")
+    return knn_idx.cpu().numpy(), knn_dist.cpu().numpy()
 
 
 def build_projection_meta(method, centered_matrix, projected_coords):
