@@ -79,6 +79,7 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 - [x] **SSE push endpoint** — `/api/stream` pushes new points as they're ingested
 - [x] **Live ingest mode** — frontend subscribes to SSE, animates new points dropping into the cloud, and appends new random-projection points in-place
 - [x] **meta_bridge integration** — VectorView watches `mb_chunks` / `mb_claims` collections live during an ingest run
+- [x] **FrontPocket & MindDrill integration** — Live ingestion watcher and multi-provider semantic search (Gemini 3072-dim embeddings via OpenRouter) across `frontpocket_memory`, `minddrill_research_thoughts`, `minddrill_chat_memory`, and `fp_reflections`
 - [x] **Redis Pub/Sub bridge** — optional Redis subscriber that forwards bot telemetry into the 3D scene
 - [x] **WebSocket ping** — heartbeat keeps connection alive across long ingest sessions
 

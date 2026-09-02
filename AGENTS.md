@@ -3,7 +3,8 @@
 ## Repository Reality Check
 - This repo is a small single-binary Go app with one Python helper and one embedded frontend file.
 - No existing agent/rule files were found (`.cursor/rules`, `.cursorrules`, `.github/copilot-instructions.md`, `claude.md`, `agents.md`).
-- No Go unit test files (`*_test.go`) are currently present; CI exists at `.github/workflows/test.yml` and runs `go test ./...`.
+- Go unit test file `main_test.go` is present; CI runs `go test ./...`.
+- FrontPocket and MindDrill collections (`frontpocket_memory`, `minddrill_research_thoughts`, `minddrill_chat_memory`, `fp_reflections`) are fully supported alongside meta_bridge.
 
 ## Essential Commands
 
@@ -24,7 +25,7 @@
 
 ### Verification Command (use after changes)
 - `go test ./...`
-  - There are currently no Go test files, so this mainly validates compile/build integrity.
+  - Validates compile/build integrity and executes unit test suite in `main_test.go`.
 
 ## Configuration
 - Copy `.env.example` to `.env`.
@@ -35,9 +36,13 @@
   - `VECTORVIEW_MAX_POINTS` (default `2000`)
   - `VECTORVIEW_REDIS_URL` (optional Redis projection cache)
   - `VECTORVIEW_CACHE_TTL_SECONDS` (default `600`)
-  - `VECTORVIEW_SEMANTIC_PROVIDER` (default `ollama`)
+  - `VECTORVIEW_SEMANTIC_PROVIDER` (default `auto`, supports `auto`, `ollama`, `openrouter`, `openai`)
   - `VECTORVIEW_OLLAMA_URL` (default `http://localhost:11434`)
   - `VECTORVIEW_EMBED_MODEL` (default `nomic-embed-text`)
+  - `OPENROUTER_API_KEY` / `VECTORVIEW_OPENROUTER_API_KEY` (for FrontPocket / 3072-dim embeddings)
+  - `VECTORVIEW_OPENROUTER_MODEL` (default `google/gemini-embedding-2-preview`)
+  - `VECTORVIEW_FRONTPOCKET_LIVE` (default `true`)
+  - `VECTORVIEW_FRONTPOCKET_COLLECTIONS` (default `frontpocket_memory,minddrill_research_thoughts,minddrill_chat_memory,fp_reflections`)
 
 ## Architecture and Data Flow
 
@@ -71,18 +76,15 @@
 - Go style is `gofmt`-compatible with tabs and minimal abstraction.
 - Qdrant access is via handwritten structs and `encoding/json`, not an SDK.
 - Handlers call `setCORS(w)` and generally write JSON directly with `json.NewEncoder`.
-- Keyword search uses Qdrant `scroll` + `filter.should` over multiple payload keys and case variants.
-- Semantic search embeds query text via Ollama and runs Qdrant nearest-neighbor search.
+- Keyword search uses Qdrant `scroll` + `filter.should` over multiple payload keys and case variants across meta_bridge and FrontPocket fields.
+- Semantic search auto-detects embedding provider and model per collection (OpenRouter for FrontPocket 3072 dims, Ollama for meta_bridge 768 dims, OpenAI for 1536 dims).
 - `/api/highlight` (`POST`) stores in-memory highlight events (`ids`, optional `focus_id`) per collection for UI polling.
 - `/api/collections` includes projection status fields (`projection_ready`, `projection_note`) by probing sample vectors.
-- Frontend clustering color key is derived from `payload.file_source` prefix (`extractClusterKey`), not from `entity_type`.
+- Frontend clustering color key is derived from `payload.file_source`, `source_title`, `attachment_filename`, `sources`, or metadata keys (`extractClusterKey`).
 
 ## Gotchas / Non-obvious Behaviors
-- `pca_gpu.py` is discovered by `pcaScript()` either:
-  - next to executable **only when binary name is exactly `vectorview`**, or
-  - fallback path `pca_gpu.py` from current working directory.
-- `QDRANT_API_KEY` is applied in Go HTTP client calls, but the Python worker currently receives only `qdrant_url` and does not set API key headers.
-  - Result: `/api/points` can fail against API-key-protected Qdrant even if other Go-backed routes work.
+- `pca_gpu.py` is discovered by `pcaScript()` in executable dir (using `filepath.Dir(exe)`) or fallback path `pca_gpu.py` from cwd.
+- `QDRANT_API_KEY` is passed via `cmd.Env` and forwarded as an `api-key` header in `pca_gpu.py`.
 - UMAP and t-SNE projections require optional Python deps (`umap-learn`, `scikit-learn`) in runtime environment.
 - Redis cache is only active when `VECTORVIEW_REDIS_URL` is configured and ping succeeds.
 - Collection picker options are disabled when `projection_ready` is false; labels include point count, vector dim, and projection note.
@@ -96,6 +98,7 @@
 
 ## File Map
 - `main.go` — server + API + inline PCA + embed
+- `main_test.go` — unit tests for collection detection, embeddings, and projection
 - `pca_gpu.py` — full-collection PCA worker
 - `static/index.html` — all UI/rendering logic
 - `.github/workflows/test.yml` — CI test workflow (`go test ./...`)

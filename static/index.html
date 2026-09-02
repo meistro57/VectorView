@@ -784,6 +784,12 @@
       <option value="memory_kind">Memory Kind</option>
       <option value="project">Project</option>
       <option value="source_type">Source Type</option>
+      <option value="attachment_category">Attachment Category</option>
+      <option value="attachment_filename">Attachment Filename</option>
+      <option value="conversation_id">Conversation ID</option>
+      <option value="strategy">Strategy</option>
+      <option value="uncertainty_class">Uncertainty Class</option>
+      <option value="type">Thought Type</option>
       <option value="custom">Custom field…</option>
     </select>
   </div>
@@ -799,6 +805,9 @@
       <option value="none" selected>None</option>
       <option value="score">score</option>
       <option value="confidence">confidence</option>
+      <option value="importance">importance</option>
+      <option value="evidence_strength">evidence_strength</option>
+      <option value="provenance_score">provenance_score</option>
       <option value="chunk_length">chunk_length</option>
       <option value="text_length">text_length</option>
     </select>
@@ -1686,8 +1695,8 @@ function renderOutliersList() {
     const payload = point.payload || {};
     const title = shortText(getSignalTitle(payload, point.id), 70);
     const snippet = shortText(getSignalSnippet(payload), 100);
-    const provider = payloadLookup(payload, 'ai_provider') || 'unknown';
-    const speaker = payloadLookup(payload, 'speaker') || '';
+    const provider = payloadLookup(payload, 'source_type', 'memory_kind', 'ai_provider') || 'signal';
+    const speaker = payloadLookup(payload, 'speaker', 'project') || '';
 
     const item = document.createElement('div');
     item.className = 'similar-item';
@@ -2282,19 +2291,35 @@ function onClick(e) {
 // ── Build particle cloud ──────────────────────────────────────────────────────
 function extractClusterKey(point, field = colorField) {
   if (field === 'source') {
-    const sourceValue = payloadLookup(point.payload, 'file_source', 'source_id', 'source_collection', 'source_file', 'source');
-    const source = sourceValue === undefined ? '' : String(sourceValue);
+    const sourceValue = payloadLookup(point.payload, 'file_source', 'attachment_filename', 'source_title', 'sources', 'source_id', 'conversation_id', 'session_id', 'project', 'source_collection', 'source_file', 'source');
+    let source = '';
+    if (Array.isArray(sourceValue)) {
+      source = sourceValue.length > 0 ? String(sourceValue[0]) : '';
+    } else if (sourceValue !== undefined && sourceValue !== null) {
+      source = String(sourceValue);
+    }
+    source = source.trim();
     if (!source) return 'unknown';
+
+    // If generic title like "DeepDrill Research Thought" or "MindDrill Chat", differentiate by strategy or session
+    if (source === 'DeepDrill Research Thought') {
+      const alt = payloadLookup(point.payload, 'strategy', 'type', 'uncertainty_class', 'session_id');
+      if (alt) return String(alt);
+    }
+
+    // Strip common file extensions
+    source = source.replace(/\.(pdf|m4a|mp3|wav|json|md|txt|csv|html)$/i, '');
     const prefix = source.split('_')[0];
     const match = prefix.match(/^(\d+)/);
     if (match) return match[1];
-    return prefix || source || 'unknown';
+    return source.replace(/_/g, ' ') || 'unknown';
   }
 
   const lookupKey = field === 'custom' ? (colorFieldCustom || '').trim() : field;
   if (!lookupKey) return 'unknown';
   const raw = payloadLookup(point.payload, lookupKey);
   if (raw === undefined || raw === null || raw === '') return 'unknown';
+  if (Array.isArray(raw)) return raw.length > 0 ? String(raw[0]) : 'unknown';
   return String(raw);
 }
 
@@ -2586,7 +2611,7 @@ function buildLegend(clusterMap) {
     const color = '#' + colorObj.getHexString();
     el.innerHTML += `<div class="legend-item">
       <div class="legend-dot" style="background:${color};box-shadow:0 0 6px ${color}"></div>
-      <span style="color:var(--text)">${key} <span style="color:var(--dim)">(${meta.count})</span></span>
+      <span style="color:var(--text)">${escapeHTML(String(key))} <span style="color:var(--dim)">(${meta.count})</span></span>
     </div>`;
   }
 
@@ -2749,17 +2774,25 @@ function escapeHTML(value) {
 }
 
 function shortText(value, maxLen) {
-  const s = String(value ?? '');
+  if (value === null || value === undefined) return '';
+  let s;
+  if (Array.isArray(value)) {
+    s = value.map(v => typeof v === 'object' ? JSON.stringify(v) : String(v)).join(', ');
+  } else if (typeof value === 'object') {
+    s = JSON.stringify(value);
+  } else {
+    s = String(value);
+  }
   return s.length > maxLen ? s.slice(0, maxLen) + '…' : s;
 }
 
 function getSignalTitle(payload, fallbackID) {
-  const title = payloadLookup(payload, 'title', 'source_id', 'file_source', 'source_file');
+  const title = payloadLookup(payload, 'source_title', 'title', 'attachment_filename', 'question', 'thought_id', 'memory_id', 'conversation_id', 'project', 'source_id', 'file_source', 'source_file');
   return title !== undefined ? title : `Signal ${fallbackID}`;
 }
 
 function getSignalSnippet(payload) {
-  const snippet = payloadLookup(payload, 'text', 'content', 'chunk_text', 'summary', 'claims', 'questions');
+  const snippet = payloadLookup(payload, 'evidence_summary', 'source_quote', 'text', 'content', 'chunk_text', 'summary', 'claims', 'questions');
   return snippet !== undefined ? snippet : 'No preview text available.';
 }
 
@@ -2896,7 +2929,17 @@ function showInspector(pt, mode = 'selected') {
   html += `<div class="insp-field"><div class="insp-key">ID</div><div class="insp-val highlight">${escapeHTML(pt.id)}</div></div>`;
   html += `<div class="insp-field"><div class="insp-key">PCA Coords</div><div class="insp-val">${pt.x.toFixed(3)}, ${pt.y.toFixed(3)}, ${pt.z.toFixed(3)}</div></div>`;
 
-  const priority = ['entity_type', 'source_id', 'source_collection', 'source_file', 'chunk_index', 'title', 'summary', 'text', 'content', 'chunk_text', 'claims', 'concepts', 'questions', 'tone', 'author', 'timestamp'];
+  const priority = [
+    'entity_type', 'source_title', 'attachment_filename', 'attachment_category',
+    'speaker', 'memory_kind', 'project', 'source_type', 'conversation_id', 'session_id',
+    'thought_id', 'memory_id', 'question', 'type', 'strategy', 'uncertainty_class',
+    'importance', 'evidence_strength', 'provenance_score', 'confidence',
+    'source_quote', 'evidence_summary', 'summary', 'text', 'content', 'chunk_text',
+    'claims', 'concepts', 'questions', 'tags', 'sources', 'tone', 'author',
+    'timestamp', 'date_basis', 'approximate_date', 'awakening_phase',
+    'ai_provider', 'ai_model', 'embedding_model', 'source_id', 'source_collection',
+    'source_file', 'chunk_index'
+  ];
   const shown = new Set();
   for (const k of priority) {
     const value = payloadLookup(payload, k);
@@ -3026,7 +3069,7 @@ function renderSimilarSignals(results) {
     const payload = row.payload || {};
     const title = shortText(getSignalTitle(payload, row.id), 80);
     const snippet = shortText(getSignalSnippet(payload), 120);
-    const source = payloadLookup(payload, 'file_source', 'source_id', 'source_file', 'source', 'date') || 'unknown source';
+    const source = payloadLookup(payload, 'source_title', 'attachment_filename', 'project', 'conversation_id', 'source_type', 'file_source', 'source_id', 'source_file', 'source', 'date') || 'unknown source';
     const offscreen = idx === undefined;
 
     const item = document.createElement('div');

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -370,7 +371,7 @@ var wsUpgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { re
 
 // defaultCollection is the fallback when a request doesn't specify ?collection=.
 // Change this in one spot rather than chasing fallbacks across handlers.
-const defaultCollection = "meta_reflections"
+var defaultCollection = "meta_reflections"
 
 type projectionCache interface {
 	Get(ctx context.Context, key string) (*PointsResponse, bool, error)
@@ -535,6 +536,35 @@ func (q *qdrantClient) collectionProjectionStatus(ctx context.Context, name stri
 		return false, "no dense vectors"
 	}
 	return true, "ok"
+}
+
+func (q *qdrantClient) detectCollectionEmbedding(ctx context.Context, collection string) (provider, model string, dims int) {
+	meta, err := q.collectionMeta(ctx, collection)
+	if err == nil {
+		dims = int(meta.VectorSize)
+	}
+	req := scrollRequest{Limit: 1, WithPayload: true, WithVectors: false}
+	raw, status, err := q.do(ctx, http.MethodPost, "/collections/"+collection+"/points/scroll", req)
+	if err != nil || status >= 400 {
+		return "", "", dims
+	}
+	var res scrollResult
+	if err := json.Unmarshal(raw, &res); err != nil || res.Result == nil || len(res.Result.Points) == 0 {
+		return "", "", dims
+	}
+	p := res.Result.Points[0]
+	if p.Payload != nil {
+		if prov, ok := p.Payload["embedding_provider"].(string); ok && strings.TrimSpace(prov) != "" {
+			provider = strings.ToLower(strings.TrimSpace(prov))
+		}
+		if mod, ok := p.Payload["embedding_model"].(string); ok && strings.TrimSpace(mod) != "" {
+			model = strings.TrimSpace(mod)
+		}
+		if d, ok := p.Payload["embedding_dimensions"].(float64); ok && d > 0 {
+			dims = int(d)
+		}
+	}
+	return provider, model, dims
 }
 
 func (q *qdrantClient) getPointByID(ctx context.Context, collection, pointID string) (*QPoint, error) {
@@ -764,6 +794,127 @@ func embedQueryWithOllama(ctx context.Context, ollamaURL, model, query string) (
 	return parsed.Embeddings[0], nil
 }
 
+func embedQueryWithOpenRouter(ctx context.Context, openrouterURL, apiKey, model, query string, dims int) ([]float64, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, fmt.Errorf("OPENROUTER_API_KEY is required for openrouter embeddings")
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = "google/gemini-embedding-2-preview"
+	}
+	base := strings.TrimRight(strings.TrimSpace(openrouterURL), "/")
+	if base == "" {
+		base = "https://openrouter.ai/api/v1"
+	}
+
+	payloadMap := map[string]interface{}{
+		"model": model,
+		"input": query,
+	}
+	if dims > 0 {
+		payloadMap["dimensions"] = dims
+	}
+
+	payload, err := json.Marshal(payloadMap)
+	if err != nil {
+		return nil, fmt.Errorf("marshal openrouter payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/embeddings", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Title", "VectorView")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("openrouter %d: %s", resp.StatusCode, string(body))
+	}
+
+	var parsed struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+			Index     int       `json:"index"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("decode openrouter response: %w", err)
+	}
+	if len(parsed.Data) == 0 || len(parsed.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("openrouter returned no embeddings")
+	}
+	return parsed.Data[0].Embedding, nil
+}
+
+func embedQueryWithOpenAI(ctx context.Context, openaiURL, apiKey, model, query string, dims int) ([]float64, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, fmt.Errorf("OPENAI_API_KEY is required for openai embeddings")
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = "text-embedding-3-small"
+	}
+	base := strings.TrimRight(strings.TrimSpace(openaiURL), "/")
+	if base == "" {
+		base = "https://api.openai.com/v1"
+	}
+
+	payloadMap := map[string]interface{}{
+		"model": model,
+		"input": query,
+	}
+	if dims > 0 {
+		payloadMap["dimensions"] = dims
+	}
+
+	payload, err := json.Marshal(payloadMap)
+	if err != nil {
+		return nil, fmt.Errorf("marshal openai payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/embeddings", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("openai %d: %s", resp.StatusCode, string(body))
+	}
+
+	var parsed struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+			Index     int       `json:"index"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("decode openai response: %w", err)
+	}
+	if len(parsed.Data) == 0 || len(parsed.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("openai returned no embeddings")
+	}
+	return parsed.Data[0].Embedding, nil
+}
+
 func canonicalPointID(v interface{}) string {
 	switch t := v.(type) {
 	case string:
@@ -843,6 +994,11 @@ func pickSearchVector(raw interface{}, preferredName string) (interface{}, strin
 
 // pythonBin returns the best available python binary
 func pythonBin() string {
+	for _, candidate := range []string{"venv/bin/python3", "venv/bin/python"} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
 	for _, candidate := range []string{"python3", "python"} {
 		if path, err := exec.LookPath(candidate); err == nil {
 			return path
@@ -856,7 +1012,7 @@ func pcaScript() string {
 	// Try next to the executable first
 	exe, err := os.Executable()
 	if err == nil {
-		candidate := strings.TrimSuffix(exe, "/vectorview") + "/pca_gpu.py"
+		candidate := filepath.Join(filepath.Dir(exe), "pca_gpu.py")
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
 		}
@@ -924,31 +1080,50 @@ func writeSSEEvent(w io.Writer, eventType string, payload []byte) error {
 	return nil
 }
 
-func watchCollectionStream(ctx context.Context, q *qdrantClient, hub *streamHub, collection string, pollInterval time.Duration) {
+func watchCollectionStream(ctx context.Context, q *qdrantClient, hub *streamHub, systemLabel, collection string, pollInterval time.Duration) {
 	collection = strings.TrimSpace(collection)
 	if collection == "" {
 		return
 	}
-	offset := 0
+	knownCount := 0
 	if meta, err := q.collectionMeta(ctx, collection); err == nil {
-		offset = int(meta.PointsCount)
+		knownCount = int(meta.PointsCount)
 	}
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	warnedNotFound := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			points, err := q.fetchPointsWindow(ctx, collection, offset, 64)
+			meta, err := q.collectionMeta(ctx, collection)
 			if err != nil {
-				log.Printf("meta_bridge watch error collection=%s: %v", collection, err)
+				if !warnedNotFound {
+					log.Printf("%s watch note: collection=%s not ready: %v", systemLabel, collection, err)
+					warnedNotFound = true
+				}
+				continue
+			}
+			warnedNotFound = false
+			currentCount := int(meta.PointsCount)
+			if currentCount <= knownCount {
+				continue
+			}
+			pointsToFetch := currentCount - knownCount
+			if pointsToFetch > 128 {
+				pointsToFetch = 128
+			}
+			points, err := q.fetchPointsWindow(ctx, collection, knownCount, pointsToFetch)
+			if err != nil {
+				log.Printf("%s watch error collection=%s: %v", systemLabel, collection, err)
 				continue
 			}
 			if len(points) == 0 {
+				knownCount = currentCount
 				continue
 			}
-			offset += len(points)
+			knownCount += len(points)
 			for _, point := range points {
 				hub.publish("point_ingested", collection, map[string]interface{}{
 					"id":      point.ID,
@@ -968,8 +1143,22 @@ func startMetaBridgeWatchers(ctx context.Context, q *qdrantClient, hub *streamHu
 		if collection == "" {
 			continue
 		}
-		go watchCollectionStream(ctx, q, hub, collection, pollInterval)
+		go watchCollectionStream(ctx, q, hub, "meta_bridge", collection, pollInterval)
 		log.Printf("meta_bridge watcher enabled for collection=%s", collection)
+	}
+}
+
+func startFrontPocketWatchers(ctx context.Context, q *qdrantClient, hub *streamHub, collections []string, pollInterval time.Duration) {
+	if len(collections) == 0 {
+		return
+	}
+	for _, rawCollection := range collections {
+		collection := strings.TrimSpace(rawCollection)
+		if collection == "" {
+			continue
+		}
+		go watchCollectionStream(ctx, q, hub, "frontpocket", collection, pollInterval)
+		log.Printf("frontpocket watcher enabled for collection=%s", collection)
 	}
 }
 
@@ -1038,6 +1227,10 @@ func runGPUPCA(parent context.Context, collection string, limit int, qdrantURL, 
 		args = append(args, vectorName)
 	}
 	cmd := exec.CommandContext(ctx, py, args...)
+	cmd.Env = os.Environ()
+	if qdrantKey := strings.TrimSpace(os.Getenv("QDRANT_API_KEY")); qdrantKey != "" {
+		cmd.Env = append(cmd.Env, "QDRANT_API_KEY="+qdrantKey)
+	}
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1105,6 +1298,10 @@ func runProjectionOnPoints(parent context.Context, points []QPoint, projectionMe
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, py, script, "--stdin", projectionMethod)
+	cmd.Env = os.Environ()
+	if qdrantKey := strings.TrimSpace(os.Getenv("QDRANT_API_KEY")); qdrantKey != "" {
+		cmd.Env = append(cmd.Env, "QDRANT_API_KEY="+qdrantKey)
+	}
 	payload, err := json.Marshal(map[string]interface{}{"points": points, "vector_name": vectorName})
 	if err != nil {
 		return PointsResponse{}, fmt.Errorf("marshal projection payload: %w", err)
@@ -1153,7 +1350,18 @@ func runProjectionOnPoints(parent context.Context, points []QPoint, projectionMe
 
 func main() {
 	_ = godotenv.Load()
+	if os.Getenv("OPENROUTER_API_KEY") == "" {
+		for _, fallbackEnv := range []string{"../frontpocket/.env", "/home/mark/frontpocket/.env"} {
+			if _, err := os.Stat(fallbackEnv); err == nil {
+				_ = godotenv.Load(fallbackEnv)
+				if os.Getenv("OPENROUTER_API_KEY") != "" {
+					break
+				}
+			}
+		}
+	}
 
+	defaultCollection = envOr("VECTORVIEW_DEFAULT_COLLECTION", envOr("QDRANT_COLLECTION", defaultCollection))
 	qdrantURL := envOr("QDRANT_URL", "http://localhost:6333")
 	qdrantKey := os.Getenv("QDRANT_API_KEY")
 	port := envOr("VECTORVIEW_PORT", "7433")
@@ -1185,9 +1393,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	semanticProvider := strings.ToLower(strings.TrimSpace(envOr("VECTORVIEW_SEMANTIC_PROVIDER", "ollama")))
-	embedModel := strings.TrimSpace(envOr("VECTORVIEW_EMBED_MODEL", "nomic-embed-text"))
-	ollamaURL := strings.TrimSpace(envOr("VECTORVIEW_OLLAMA_URL", "http://localhost:11434"))
+	semanticProvider := strings.ToLower(strings.TrimSpace(envOr("VECTORVIEW_SEMANTIC_PROVIDER", "auto")))
+	embedModel := strings.TrimSpace(envOr("VECTORVIEW_EMBED_MODEL", envOr("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")))
+	ollamaURL := strings.TrimSpace(envOr("VECTORVIEW_OLLAMA_URL", envOr("OLLAMA_BASE_URL", "http://localhost:11434")))
+
+	openrouterBaseURL := strings.TrimSpace(envOr("VECTORVIEW_OPENROUTER_BASE_URL", envOr("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")))
+	openrouterKey := strings.TrimSpace(envOr("VECTORVIEW_OPENROUTER_API_KEY", os.Getenv("OPENROUTER_API_KEY")))
+	openrouterModel := strings.TrimSpace(envOr("VECTORVIEW_OPENROUTER_MODEL", envOr("OPENROUTER_EMBEDDING_MODEL", "google/gemini-embedding-2-preview")))
+
+	openaiBaseURL := strings.TrimSpace(envOr("VECTORVIEW_OPENAI_BASE_URL", envOr("OPENAI_BASE_URL", "https://api.openai.com/v1")))
+	openaiKey := strings.TrimSpace(envOr("VECTORVIEW_OPENAI_API_KEY", os.Getenv("OPENAI_API_KEY")))
+	openaiModel := strings.TrimSpace(envOr("VECTORVIEW_OPENAI_MODEL", envOr("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")))
+
 	streamHeartbeatSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_STREAM_HEARTBEAT_SECONDS", "15"))
 	if streamHeartbeatSeconds <= 0 {
 		streamHeartbeatSeconds = 15
@@ -1204,6 +1421,16 @@ func main() {
 	metaBridgePollSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_META_BRIDGE_POLL_SECONDS", "3"))
 	if metaBridgePollSeconds <= 0 {
 		metaBridgePollSeconds = 3
+	}
+
+	frontpocketEnabled, err := strconv.ParseBool(strings.TrimSpace(envOr("VECTORVIEW_FRONTPOCKET_LIVE", "true")))
+	if err != nil {
+		frontpocketEnabled = true
+	}
+	frontpocketCollections := strings.Split(strings.TrimSpace(envOr("VECTORVIEW_FRONTPOCKET_COLLECTIONS", "frontpocket_memory,minddrill_research_thoughts,minddrill_chat_memory,fp_reflections")), ",")
+	frontpocketPollSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_FRONTPOCKET_POLL_SECONDS", "3"))
+	if frontpocketPollSeconds <= 0 {
+		frontpocketPollSeconds = 3
 	}
 	redisTelemetryChannel := strings.TrimSpace(envOr("VECTORVIEW_REDIS_PUBSUB_CHANNEL", "vectorview.telemetry"))
 	streamReplayDefault, _ := strconv.Atoi(envOr("VECTORVIEW_STREAM_REPLAY_COUNT", "0"))
@@ -1637,8 +1864,14 @@ func main() {
 		}
 
 		searchableKeys := []string{
-			"text", "content", "chunk_text", "title", "summary", "claims", "concepts", "questions", "source_id", "file_source", "source_file", "tone",
-			"TEXT", "CONTENT", "CHUNK_TEXT", "TITLE", "SUMMARY", "CLAIMS", "CONCEPTS", "QUESTIONS", "SOURCE_ID", "FILE_SOURCE", "SOURCE_FILE", "TONE",
+			"text", "content", "chunk_text", "title", "source_title", "summary", "evidence_summary", "source_quote", "question",
+			"attachment_filename", "attachment_category", "project", "conversation_id", "session_id", "memory_id", "thought_id",
+			"speaker", "memory_kind", "source_type", "strategy", "uncertainty_class", "claims", "concepts", "questions", "tags",
+			"sources", "source_id", "file_source", "source_file", "tone", "author", "awakening_phase",
+			"TEXT", "CONTENT", "CHUNK_TEXT", "TITLE", "SOURCE_TITLE", "SUMMARY", "EVIDENCE_SUMMARY", "SOURCE_QUOTE", "QUESTION",
+			"ATTACHMENT_FILENAME", "ATTACHMENT_CATEGORY", "PROJECT", "CONVERSATION_ID", "SESSION_ID", "MEMORY_ID", "THOUGHT_ID",
+			"SPEAKER", "MEMORY_KIND", "SOURCE_TYPE", "STRATEGY", "UNCERTAINTY_CLASS", "CLAIMS", "CONCEPTS", "QUESTIONS", "TAGS",
+			"SOURCES", "SOURCE_ID", "FILE_SOURCE", "SOURCE_FILE", "TONE", "AUTHOR", "AWAKENING_PHASE",
 		}
 		matches := make([]filterMatch, 0, len(searchableKeys))
 		for _, key := range searchableKeys {
@@ -1711,16 +1944,59 @@ func main() {
 		}
 		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
 
+		requestedProvider := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("provider")))
+		requestedModel := strings.TrimSpace(r.URL.Query().Get("model"))
+
+		provider := requestedProvider
+		model := requestedModel
+
+		detectedProvider, detectedModel, detectedDims := q.detectCollectionEmbedding(r.Context(), targetCollection)
+
+		if provider == "" || provider == "auto" {
+			if detectedProvider != "" {
+				provider = detectedProvider
+			} else if semanticProvider != "" && semanticProvider != "auto" {
+				provider = semanticProvider
+			} else {
+				if detectedDims == 3072 {
+					provider = "openrouter"
+				} else if detectedDims == 1536 {
+					provider = "openai"
+				} else {
+					provider = "ollama"
+				}
+			}
+		}
+
+		if model == "" {
+			if detectedModel != "" && (requestedProvider == "" || requestedProvider == "auto" || requestedProvider == detectedProvider) {
+				model = detectedModel
+			} else {
+				switch provider {
+				case "openrouter":
+					model = openrouterModel
+				case "openai":
+					model = openaiModel
+				default:
+					model = embedModel
+				}
+			}
+		}
+
 		var embedding []float64
-		switch semanticProvider {
+		switch provider {
+		case "openrouter":
+			embedding, err = embedQueryWithOpenRouter(r.Context(), openrouterBaseURL, openrouterKey, model, queryStr, detectedDims)
+		case "openai":
+			embedding, err = embedQueryWithOpenAI(r.Context(), openaiBaseURL, openaiKey, model, queryStr, detectedDims)
 		case "ollama", "":
-			embedding, err = embedQueryWithOllama(r.Context(), ollamaURL, embedModel, queryStr)
+			embedding, err = embedQueryWithOllama(r.Context(), ollamaURL, model, queryStr)
 		default:
-			http.Error(w, fmt.Sprintf("unsupported semantic provider: %s", semanticProvider), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("unsupported semantic provider: %s", provider), http.StatusBadRequest)
 			return
 		}
 		if err != nil {
-			http.Error(w, fmt.Sprintf("embedding failed: %v", err), http.StatusBadGateway)
+			http.Error(w, fmt.Sprintf("embedding failed (%s/%s): %v", provider, model, err), http.StatusBadGateway)
 			return
 		}
 
@@ -1938,6 +2214,9 @@ func main() {
 
 	if metaBridgeEnabled {
 		startMetaBridgeWatchers(streamCtx, q, streamHub, metaBridgeCollections, time.Duration(metaBridgePollSeconds)*time.Second)
+	}
+	if frontpocketEnabled {
+		startFrontPocketWatchers(streamCtx, q, streamHub, frontpocketCollections, time.Duration(frontpocketPollSeconds)*time.Second)
 	}
 	if redisURL := strings.TrimSpace(os.Getenv("VECTORVIEW_REDIS_URL")); redisURL != "" {
 		startRedisTelemetryBridge(streamCtx, redisURL, redisTelemetryChannel, streamHub)

@@ -170,14 +170,20 @@ VECTORVIEW_WS_PING_SECONDS=20
 VECTORVIEW_META_BRIDGE_LIVE=true
 VECTORVIEW_META_BRIDGE_COLLECTIONS=mb_chunks,mb_claims
 VECTORVIEW_META_BRIDGE_POLL_SECONDS=3
+VECTORVIEW_FRONTPOCKET_LIVE=true
+VECTORVIEW_FRONTPOCKET_COLLECTIONS=frontpocket_memory,minddrill_research_thoughts,minddrill_chat_memory,fp_reflections
+VECTORVIEW_FRONTPOCKET_POLL_SECONDS=3
 VECTORVIEW_REDIS_PUBSUB_CHANNEL=vectorview.telemetry
 VECTORVIEW_REDIS_STREAM_KEY=vectorview.events
 VECTORVIEW_REDIS_STREAM_MAXLEN=20000
 
-# Semantic search embedding provider
-VECTORVIEW_SEMANTIC_PROVIDER=ollama
+# Semantic search embedding provider (auto, ollama, openrouter, openai)
+VECTORVIEW_SEMANTIC_PROVIDER=auto
 VECTORVIEW_OLLAMA_URL=http://localhost:11434
 VECTORVIEW_EMBED_MODEL=nomic-embed-text
+OPENROUTER_API_KEY=
+VECTORVIEW_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+VECTORVIEW_OPENROUTER_MODEL=google/gemini-embedding-2-preview
 ```
 
 Environment variables override `.env` — works cleanly with Docker and systemd.
@@ -404,6 +410,7 @@ VectorView is part of the **Meistro Knowledge Archaeology** stack:
 | Project | Role |
 |---|---|
 | [meta_bridge](https://github.com/meistro57/meta-bridge) | Ingestion, chunking, claim extraction → Qdrant |
+| [FrontPocket](https://github.com/meistro57/frontpocket) | Local-first AI companion, MindDrill cognitive architecture, memory store → Qdrant |
 | **VectorView** | 3D visual exploration of Qdrant collections |
 | Vectoreologist | TUI-based archaeological reasoning over vector topology |
 | KAE | Autonomous knowledge graph builder (Wikipedia, arXiv, Gutenberg) |

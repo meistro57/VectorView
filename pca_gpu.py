@@ -8,6 +8,7 @@ Outputs JSON to stdout: {"points": [...], "total": N, "projection": {...}}
 """
 
 import json
+import os
 import sys
 import time
 
@@ -26,6 +27,7 @@ def fetch_points(collection, limit, qdrant_url):
     all_points = []
     offset = None
     page_size = min(200, limit)
+    api_key = os.getenv("QDRANT_API_KEY", "").strip()
 
     while True:
         body = {
@@ -38,10 +40,13 @@ def fetch_points(collection, limit, qdrant_url):
 
         data = json.dumps(body).encode()
         url = f"{qdrant_url}/collections/{collection}/points/scroll"
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["api-key"] = api_key
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
