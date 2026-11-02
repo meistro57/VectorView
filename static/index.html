@@ -280,6 +280,44 @@
     transition: background 0.2s, opacity 0.2s;
   }
 
+  #inspector-actions-2 {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+  }
+
+  #bookmarks-empty {
+    font-size: 0.65rem;
+    color: var(--dim);
+    line-height: 1.7;
+  }
+
+  .bookmark-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 0;
+    border-bottom: 1px solid #ffffff10;
+    font-size: 0.66rem;
+  }
+
+  .bookmark-item button {
+    background: transparent;
+    border: none;
+    color: var(--dim);
+    cursor: pointer;
+    font-family: var(--font-mono);
+  }
+
+  .bookmark-label {
+    flex: 1;
+    cursor: pointer;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .scan-btn:hover { background: #00f5ff1a; }
 
   .scan-btn.secondary {
@@ -917,6 +955,11 @@
     <button id="btn-find-similar" class="scan-btn" disabled>FIND SIMILAR</button>
     <button id="btn-clear-scan" class="scan-btn secondary" disabled>CLEAR SCAN</button>
   </div>
+  <div id="inspector-actions-2">
+    <button id="btn-bookmark" class="scan-btn secondary" disabled>BOOKMARK</button>
+    <button id="btn-history-back" class="scan-btn secondary" disabled>◀ PREV</button>
+    <button id="btn-history-forward" class="scan-btn secondary" disabled>NEXT ▶</button>
+  </div>
   <div id="scan-status"></div>
   <div id="radius-controls">
     <div id="radius-head"><span>COSINE RADIUS</span><span id="radius-val">0.92</span></div>
@@ -927,6 +970,11 @@
     <div class="panel-title">⬡ Similar Signals</div>
     <div id="similar-empty">Select a point and run Find Similar.</div>
     <div id="similar-list"></div>
+  </div>
+  <div id="bookmarks-panel">
+    <div class="panel-title">⬡ Bookmarks <span id="val-bookmark-count" style="color:var(--dim);font-size:0.65rem;">(0)</span></div>
+    <div id="bookmarks-empty">Star a point to pin it here.</div>
+    <div id="bookmarks-list"></div>
   </div>
 </div>
 
@@ -1169,6 +1217,11 @@ let currentLoadProgressID = '';
 let currentProjectionMeta = null;
 let uiEventSource = null;
 let uiEventSourceCollection = '';
+let cameraFlight = null;
+let selectionHistory = [];
+let selectionHistoryIndex = -1;
+let bookmarks = [];
+let suppressHistoryPush = false;
 let lastHighlightEventID = '';
 let liveIngestEnabled = false;
 let liveIngestSource = null;
@@ -2947,6 +3000,233 @@ function showInspector(pt, mode = 'selected') {
   el.innerHTML = html;
 }
 
+function cancelCameraFlight() {
+  cameraFlight = null;
+}
+
+function flyCameraTo(targetPoint, distance) {
+  if (!controls || !camera) return;
+  const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const direction = camera.position.clone().sub(controls.target);
+  if (direction.lengthSq() < 1e-6) direction.set(0, 0, 1);
+  direction.normalize();
+
+  if (reduceMotion) {
+    controls.target.copy(targetPoint);
+    camera.position.copy(targetPoint.clone().add(direction.multiplyScalar(distance)));
+    if (typeof controls._updateSpherical === 'function') controls._updateSpherical();
+    cameraFlight = null;
+    return;
+  }
+
+  cameraFlight = {
+    start: performance.now(),
+    duration: 650,
+    startTarget: controls.target.clone(),
+    endTarget: targetPoint.clone(),
+    startPos: camera.position.clone(),
+    endPos: targetPoint.clone().add(direction.multiplyScalar(distance)),
+  };
+}
+
+function stepCameraFlight(now) {
+  if (!cameraFlight) return;
+  const t = Math.min(1, (now - cameraFlight.start) / cameraFlight.duration);
+  const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+  controls.target.lerpVectors(cameraFlight.startTarget, cameraFlight.endTarget, eased);
+  camera.position.lerpVectors(cameraFlight.startPos, cameraFlight.endPos, eased);
+  if (typeof controls._updateSpherical === 'function') controls._updateSpherical();
+  if (t >= 1) cameraFlight = null;
+}
+
+function flyToIndices(indices) {
+  if (!particleSystem || !controls || !camera) return;
+  const positions = particleSystem.geometry.attributes.position.array;
+  const centroid = new THREE.Vector3();
+  let counted = 0;
+  for (const index of indices.slice(0, 48)) {
+    if (!Number.isInteger(index) || index < 0 || index * 3 + 2 >= positions.length) continue;
+    centroid.x += positions[index * 3];
+    centroid.y += positions[index * 3 + 1];
+    centroid.z += positions[index * 3 + 2];
+    counted += 1;
+  }
+  if (!counted) return;
+  centroid.multiplyScalar(1 / counted);
+  const currentDistance = camera.position.distanceTo(controls.target) || 120;
+  const distance = Math.max(70, Math.min(currentDistance, 240));
+  flyCameraTo(centroid, distance);
+}
+
+const BOOKMARKS_KEY = 'vectorview_bookmarks';
+const HISTORY_LIMIT = 50;
+
+function pointLabel(point) {
+  if (!point) return 'unknown';
+  const payload = point.payload || {};
+  for (const key of ['title', 'source_title', 'text', 'content', 'chunk_text', 'summary', 'question']) {
+    const value = payload[key];
+    if (typeof value === 'string' && value.trim()) return shortText(value.trim(), 48);
+  }
+  return String(pointIDKey(point.id));
+}
+
+function loadBookmarks() {
+  try {
+    const raw = localStorage.getItem(BOOKMARKS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    bookmarks = Array.isArray(parsed)
+      ? parsed.filter((entry) => entry && entry.id && entry.collection)
+      : [];
+  } catch {
+    bookmarks = [];
+  }
+  renderBookmarks();
+}
+
+function persistBookmarks() {
+  try {
+    localStorage.setItem(BOOKMARKS_KEY, JSON.stringify(bookmarks));
+  } catch {
+  }
+}
+
+function bookmarkKey(entry) {
+  return `${entry.collection}::${entry.id}`;
+}
+
+function isBookmarked(point, collection) {
+  if (!point) return false;
+  const key = `${collection}::${pointIDKey(point.id)}`;
+  return bookmarks.some((entry) => bookmarkKey(entry) === key);
+}
+
+function toggleBookmark() {
+  if (!selectedPoint) return;
+  const id = pointIDKey(selectedPoint.id);
+  const key = `${currentCollection}::${id}`;
+  const existing = bookmarks.findIndex((entry) => bookmarkKey(entry) === key);
+  if (existing >= 0) {
+    bookmarks.splice(existing, 1);
+    setScanStatus('Bookmark removed.', 'muted');
+  } else {
+    bookmarks.unshift({
+      id,
+      collection: currentCollection,
+      label: pointLabel(selectedPoint),
+      saved_at: Date.now(),
+    });
+    setScanStatus('Bookmarked.', 'ok');
+  }
+  persistBookmarks();
+  renderBookmarks();
+  refreshBookmarkButton();
+}
+
+function renderBookmarks() {
+  const list = document.getElementById('bookmarks-list');
+  const empty = document.getElementById('bookmarks-empty');
+  const count = document.getElementById('val-bookmark-count');
+  if (!list || !empty || !count) return;
+
+  count.textContent = `(${bookmarks.length})`;
+  empty.style.display = bookmarks.length ? 'none' : 'block';
+  list.innerHTML = '';
+
+  for (const entry of bookmarks) {
+    const row = document.createElement('div');
+    row.className = 'bookmark-item';
+
+    const label = document.createElement('span');
+    label.className = 'bookmark-label';
+    label.textContent = entry.label || entry.id;
+    label.title = `${entry.collection} · ${entry.id}`;
+    label.addEventListener('click', () => jumpToBookmark(entry));
+
+    const remove = document.createElement('button');
+    remove.textContent = '✕';
+    remove.title = 'Remove bookmark';
+    remove.addEventListener('click', (event) => {
+      event.stopPropagation();
+      bookmarks = bookmarks.filter((candidate) => bookmarkKey(candidate) !== bookmarkKey(entry));
+      persistBookmarks();
+      renderBookmarks();
+    });
+
+    row.appendChild(label);
+    row.appendChild(remove);
+    list.appendChild(row);
+  }
+}
+
+function jumpToBookmark(entry) {
+  if (!entry || !entry.id) return;
+  if (entry.collection !== currentCollection) {
+    setScanStatus(`Bookmark belongs to ${entry.collection}. Load that collection first.`, 'error');
+    return;
+  }
+  const index = pointIndexByID.get(pointIDKey(entry.id));
+  if (!Number.isInteger(index)) {
+    setScanStatus('Bookmark is outside the visible sample.', 'error');
+    return;
+  }
+  selectPointByIndex(index);
+  flyToIndices([index]);
+}
+
+function refreshBookmarkButton() {
+  const button = document.getElementById('btn-bookmark');
+  if (!button) return;
+  button.disabled = !selectedPoint;
+  button.textContent = isBookmarked(selectedPoint, currentCollection) ? 'UNBOOKMARK' : 'BOOKMARK';
+}
+
+function historyEntryFor(point) {
+  if (!point) return null;
+  return { id: pointIDKey(point.id), collection: currentCollection, label: pointLabel(point) };
+}
+
+function recordSelection(point) {
+  if (!point || suppressHistoryPush) return;
+  const entry = historyEntryFor(point);
+  if (!entry || !entry.id) return;
+  const current = selectionHistory[selectionHistoryIndex];
+  if (current && current.collection === entry.collection && current.id === entry.id) return;
+  selectionHistory = selectionHistory.slice(0, selectionHistoryIndex + 1);
+  selectionHistory.push(entry);
+  if (selectionHistory.length > HISTORY_LIMIT) selectionHistory.shift();
+  selectionHistoryIndex = selectionHistory.length - 1;
+  refreshHistoryButtons();
+}
+
+function refreshHistoryButtons() {
+  const back = document.getElementById('btn-history-back');
+  const forward = document.getElementById('btn-history-forward');
+  if (back) back.disabled = selectionHistoryIndex <= 0;
+  if (forward) forward.disabled = selectionHistoryIndex < 0 || selectionHistoryIndex >= selectionHistory.length - 1;
+}
+
+function stepSelectionHistory(direction) {
+  const next = selectionHistoryIndex + direction;
+  if (next < 0 || next >= selectionHistory.length) return;
+  const entry = selectionHistory[next];
+  if (entry.collection !== currentCollection) {
+    setScanStatus(`History entry belongs to ${entry.collection}.`, 'error');
+    return;
+  }
+  const index = pointIndexByID.get(pointIDKey(entry.id));
+  if (!Number.isInteger(index)) {
+    setScanStatus('History entry is outside the visible sample.', 'error');
+    return;
+  }
+  selectionHistoryIndex = next;
+  suppressHistoryPush = true;
+  selectPointByIndex(index);
+  suppressHistoryPush = false;
+  flyToIndices([index]);
+  refreshHistoryButtons();
+}
+
 function focusPointByIndex(index, closeInspect = false) {
   if (!particleSystem || !controls || !camera || index < 0) return;
   const pos = particleSystem.geometry.attributes.position.array;
@@ -3106,6 +3386,8 @@ function selectPointByIndex(index, options = {}) {
     syncSimilarItemStates();
   }
   showInspector(selectedPoint, 'selected');
+  recordSelection(selectedPoint);
+  refreshBookmarkButton();
   updateSignalButtons();
   if (similarityModeActive) {
     applySignalScanHighlight();
@@ -3124,12 +3406,19 @@ function clearInspectorSelection() {
     syncSimilarItemStates();
     applySignalScanHighlight();
   }
+  refreshBookmarkButton();
   updateSignalButtons();
 }
 
 function handleGlobalShortcuts(event) {
   if (event.key === 'Escape') {
     clearInspectorSelection();
+    return;
+  }
+
+  if (event.altKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+    event.preventDefault();
+    stepSelectionHistory(event.key === 'ArrowLeft' ? -1 : 1);
     return;
   }
 
@@ -3167,6 +3456,10 @@ function applySimilarityResponse(neighbors) {
   }
   const offscreen = scanResults.length - visibleHits;
   const note = offscreen > 0 ? ` · ${offscreen} outside visible sample` : '';
+  const neighborIndices = scanResults
+    .map((neighbor) => pointIndexByID.get(pointIDKey(neighbor.id)))
+    .filter((index) => Number.isInteger(index));
+  flyToIndices(neighborIndices);
   return { visibleHits, note };
 }
 
@@ -3256,6 +3549,7 @@ function applyExternalHighlight(event) {
   const focusIndex = pointIndexByID.get(focusKey);
   if (Number.isInteger(focusIndex) && focusIndex >= 0 && focusIndex < allPoints.length) {
     selectPointByIndex(focusIndex);
+    flyToIndices([focusIndex]);
   }
 
   similarityModeActive = true;
@@ -3391,6 +3685,7 @@ function animate() {
     }
   }
 
+  stepCameraFlight(now);
   controls.setAutoRotateSpeed(rotSpeed);
   controls.update();
   stepLiveDrops(delta);
@@ -3567,6 +3862,7 @@ async function doSearch() {
     }
     const data = await res.json();
     buildParticles(data.points || [], data.projection || null);
+    flyToIndices(allPoints.map((_, index) => index));
     const modeLabel = searchMode === 'semantic' ? 'SEM' : 'KEY';
     const crossNote = searchMode === 'semantic' && crossCollectionTarget ? ` (${currentCollection} → ${crossCollectionTarget})` : '';
     document.getElementById('search-status').textContent = `${(data.points || []).length} ${modeLabel} HITS${crossNote}`;
@@ -3578,6 +3874,11 @@ async function doSearch() {
 
 // ── Controls wiring ───────────────────────────────────────────────────────────
 function wireControls() {
+  if (renderer && renderer.domElement) {
+    renderer.domElement.addEventListener('pointerdown', cancelCameraFlight);
+    renderer.domElement.addEventListener('wheel', cancelCameraFlight, { passive: true });
+  }
+
   const pointLimitCtrl = document.getElementById('ctrl-point-limit');
   pointLimitCtrl.addEventListener('input', e => {
     pointLimit = parseInt(e.target.value, 10);
@@ -3746,6 +4047,9 @@ function wireControls() {
   document.getElementById('btn-find-similar').addEventListener('click', runFindSimilar);
   document.getElementById('btn-radius-scan').addEventListener('click', runSimilarityRadius);
   document.getElementById('btn-clear-scan').addEventListener('click', clearSignalScan);
+  document.getElementById('btn-bookmark').addEventListener('click', toggleBookmark);
+  document.getElementById('btn-history-back').addEventListener('click', () => stepSelectionHistory(-1));
+  document.getElementById('btn-history-forward').addEventListener('click', () => stepSelectionHistory(1));
 
   document.getElementById('ctrl-radius').addEventListener('input', e => {
     similarityRadius = parseFloat(e.target.value);
@@ -3787,6 +4091,7 @@ async function main() {
   initScene();
   animate();
   wireControls();
+  loadBookmarks();
   startUIEventStream();
   await loadCollections();
   await loadPoints(currentCollection, pointLimit);

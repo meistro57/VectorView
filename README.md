@@ -75,7 +75,9 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Loading overlay with progress percentage while vectors are fetched and projected
 - Top HUD load-state badge (FETCH / PROJECTING / RENDERING / READY / ERROR) for at-a-glance projection status
 - Responsive HUD collapse for narrow viewports (mobile/tablet)
-- Keyboard shortcuts: `R` reload, `Space` pause/resume rotation, `Esc` clear inspector selection
+- Keyboard shortcuts: `R` reload, `Space` pause/resume rotation, `Esc` clear inspector selection, `Alt+←/→` walk selection history
+- Bookmarks: star any point to pin it in the HUD, stored locally per collection
+- Camera ease: search results, neighbor scans, and external highlights glide the view to the result centroid
 - Reload button — re-pull latest vectors on demand
 - Live mode toggle — subscribe to stream events and keep a WebSocket heartbeat alive during long ingest sessions
 - Screenshot button — export current viewport as PNG
@@ -121,6 +123,23 @@ go build -o vectorview .
 ./vectorview
 ```
 
+### Run with Docker (app + Qdrant)
+
+```bash
+docker compose up --build
+```
+
+`compose.yaml` starts VectorView on `:7433` next to a `qdrant` service and keeps the
+projection cache in a named volume. To add optional projection extras (t-SNE / UMAP),
+rebuild with build args:
+
+```bash
+docker build --build-arg INSTALL_EXTRAS="scikit-learn umap-learn" -t vectorview:extras .
+```
+
+The image runs as a non-root user, exposes `/healthz` for the container healthcheck,
+and reads the same environment variables as a local run.
+
 ### Test requirements
 
 - Go 1.22+
@@ -128,17 +147,13 @@ go build -o vectorview .
 - No live Qdrant dependency is required for `go test ./...` right now
 
 ```bash
-go test ./...
+go test ./...                    # handlers + helpers, no live services
+python3 -m unittest discover -s tests   # projection worker (needs numpy)
 ```
 
-Latest local verification:
-
-```bash
-$ go test ./...
-?   	github.com/meistro57/vectorview	[no test files]
-```
-
-This still confirms the app compiles and links cleanly end-to-end.
+CI runs `gofmt`, `go vet`, `staticcheck`, `go test -race ./...`, and the Python
+worker suite on every push and pull request (`VECTORVIEW_PCA_BACKEND=numpy` pins
+the worker to a deterministic backend).
 
 ---
 
@@ -250,6 +265,8 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | 📸 SNAPSHOT | Export current viewport as PNG |
 | ↺ RELOAD | Re-pull vectors from Qdrant |
 | R / Space / Esc | Reload / pause rotation / clear inspector |
+| Alt + ← / → | Walk back/forward through selection history |
+| BOOKMARK | Star the inspected point (persisted locally per collection) |
 
 ---
 
@@ -404,18 +421,24 @@ Example response from `/api/collections/{collection}/points/{point_id}/similar-r
 
 ```
 VectorView/
-├── main.go          # Go server — Qdrant client, API handlers, projection orchestration, embed
+├── main.go          # Startup — Qdrant HTTP client, projection worker processes, caches, embeddings, static embed
+├── config.go        # Env parsing, startup config report, projection-worker probe
+├── server.go        # server struct, route table, one method per API route
 ├── pca_gpu.py       # Python projection worker for /api/points, /api/search, /api/semantic-search (PCA/random/t-SNE/UMAP)
 ├── static/
 │   └── index.html   # Entire frontend — Three.js, GLSL shaders, HUD
+├── tests/
+│   └── test_pca_gpu.py  # Projection-worker suite (unittest, numpy only)
+├── Dockerfile       # Multi-stage image: static Go binary + numpy Python runtime
+├── compose.yaml     # App + Qdrant + persistent projection-cache volume
 ├── go.mod
 ├── go.sum
 ├── .github/
 │   └── workflows/
-│       └── test.yml # CI: run go test ./... on push/PR
+│       └── test.yml # CI: gofmt, vet, go test -race, staticcheck, Python worker tests
 ├── .env             # Local config (gitignored)
 ├── .env.example     # Config template
-├── Makefile         # make run / make build
+├── Makefile         # make run / build / test / python-test / docker-*
 └── ROADMAP.md       # Where this is going
 ```
 

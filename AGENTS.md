@@ -16,6 +16,10 @@
 - `make build` → builds `./vectorview`
 - `make tidy` → runs `go mod tidy`
 - `make install-dep` → `go get github.com/joho/godotenv`
+- `make test` → `go test ./...`
+- `make python-test` → `venv/bin/python3 -m unittest discover -s tests`
+- `make fmt` / `make vet` → formatting and vet checks
+- `make docker-build` / `make docker-up` / `make docker-down` → container workflow
 
 ### Direct Commands Seen in README
 - `go mod tidy`
@@ -25,7 +29,10 @@
 
 ### Verification Command (use after changes)
 - `go test ./...`
-  - Validates compile/build integrity and executes unit test suite in `main_test.go`.
+  - Runs handler tests (`server_test.go`), helper tests (`main_test.go`), and compile checks.
+- `python3 -m unittest discover -s tests`
+  - Runs the projection-worker suite; set `VECTORVIEW_PCA_BACKEND=numpy` for determinism.
+- CI (`.github/workflows/test.yml`) additionally enforces `gofmt`, `go vet`, `staticcheck`, and `go test -race ./...`.
 
 ## Configuration
 - Copy `.env.example` to `.env`.
@@ -56,7 +63,10 @@
 ## Architecture and Data Flow
 
 ### High-level shape
-- `main.go`: backend server, Qdrant HTTP client, API handlers, Redis-backed projection cache, semantic embedding calls, static embed.
+- `main.go`: startup, Qdrant HTTP client, projection worker process management, caches, embeddings, static embed.
+- `config.go`: environment parsing, startup config report, projection-worker probe.
+- `server.go`: `server` struct, route table, and one method per API route.
+- `tests/test_pca_gpu.py`: projection-worker test suite.
 - `pca_gpu.py`: subprocess worker for projection (`pca` / `random` / `tsne` / `umap`).
 - `static/index.html`: entire frontend (HTML + CSS + JS + shaders + controls) in one file.
 
@@ -109,6 +119,9 @@
 ## File Map
 - `main.go` — server + API + inline PCA + embed
 - `main_test.go` — unit tests for collection detection, embeddings, and projection
+- `server_test.go` — handler tests against a fake Qdrant
+- `config.go` / `server.go` — configuration, route table, and handler methods
+- `Dockerfile` / `compose.yaml` — container image (app + Qdrant) and healthcheck
 - `pca_gpu.py` — full-collection PCA worker
 - `static/index.html` — all UI/rendering logic
 - `.github/workflows/test.yml` — CI test workflow (`go test ./...`)

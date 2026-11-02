@@ -761,20 +761,6 @@ func (g *projectionFlights) do(key string, fn func() (PointsResponse, error)) (P
 
 var projectionInFlight = newProjectionFlights()
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 // ── Qdrant client ─────────────────────────────────────────────────────────────
 
 func newQdrant(base, key string) *qdrantClient {
@@ -952,7 +938,7 @@ func (q *qdrantClient) fetchPointsWindow(ctx context.Context, collection string,
 
 	for len(out) < count {
 		req := scrollRequest{
-			Limit:       minInt(200, max(32, count-len(out))),
+			Limit:       min(200, max(32, count-len(out))),
 			WithPayload: true,
 			WithVectors: true,
 			Offset:      offset,

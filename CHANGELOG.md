@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Camera easing: search results, neighbor scans, and external highlights glide the view to the result centroid over ~650ms, cancel on any drag/scroll, and jump instead when `prefers-reduced-motion` is set.
+- Selection history with `Alt+←` / `Alt+→` plus HUD prev/next buttons, and a bookmarks panel that pins inspected points to `localStorage` per collection.
+- Container workflow: multi-stage `Dockerfile` (static Go binary plus a numpy-enabled Python runtime, non-root, `/healthz` healthcheck), `compose.yaml` bundling Qdrant with a persistent projection-cache volume, `.dockerignore`, and `make docker-build` / `docker-up` / `docker-down` targets.
+- CI now also enforces `gofmt`, `go vet`, `staticcheck`, `go test -race ./...`, and the projection-worker unittest suite.
 - Handler layer extracted from `main()` onto a `server` type with per-route methods, plus `httptest` coverage (collections, points, search, semantic search, highlight, similarity, health, inline fallback) backed by a fake Qdrant.
 - Inline Go PCA fallback: when `pca_gpu.py` is unavailable or fails and the requested point count is within `VECTORVIEW_INLINE_PCA_MAX`, `/api/points` projects in-process and reports `projection.method = "pca-go-fallback"` instead of failing.
 - Startup configuration report covering Qdrant reachability and latency, cache backends, projection slots, worker interpreter and available Python modules, and embedding provider keys. `VECTORVIEW_STRICT_CONFIG=1` turns warnings into a startup failure.
@@ -37,6 +41,7 @@ All notable changes to this project will be documented in this file.
 - GitHub Actions workflow (`.github/workflows/test.yml`) to run `go test ./...` on push and pull request.
 
 ### Changed
+- Replaced the local `max`/`minInt` helpers with Go's built-in `min`/`max`.
 - Random projection normalization adjusted to stabilize incremental append behavior.
 - `GET /api/points` no longer re-runs the projection worker for concurrent identical requests, and its result is now written to the disk cache even when Redis is not configured.
 - API failures now return a stable error envelope instead of plain-text messages, and the UI surfaces `error.message` in the load/scan status line.
