@@ -15,6 +15,9 @@ __pycache__/
 .venv/
 venv/
 
+# Projection cache
+.cache/
+
 # OS
 .DS_Store
 Thumbs.db

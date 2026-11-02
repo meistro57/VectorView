@@ -4,20 +4,29 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -431,6 +440,327 @@ func projectionCacheKey(collection string, limit int, projectionMethod, vectorNa
 	}
 	return fmt.Sprintf("vectorview:projection:v1:%s:%d:%s:%s", collection, limit, projectionMethod, vectorName)
 }
+
+// ── Disk projection cache ─────────────────────────────────────────────────────
+
+type diskProjectionCache struct {
+	dir      string
+	ttl      time.Duration
+	maxBytes int64
+	writes   atomic.Int64
+}
+
+type diskCacheEntry struct {
+	StoredAt int64           `json:"stored_at"`
+	Data     *PointsResponse `json:"data"`
+}
+
+func newDiskProjectionCache(dir string, ttl time.Duration, maxBytes int64) (*diskProjectionCache, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil, nil
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve cache dir: %w", err)
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return nil, fmt.Errorf("create cache dir: %w", err)
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	if maxBytes <= 0 {
+		maxBytes = 512 << 20
+	}
+	cache := &diskProjectionCache{dir: abs, ttl: ttl, maxBytes: maxBytes}
+	cache.prune()
+	return cache, nil
+}
+
+func (c *diskProjectionCache) path(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return filepath.Join(c.dir, hex.EncodeToString(sum[:])+".json")
+}
+
+func (c *diskProjectionCache) Get(ctx context.Context, key string) (*PointsResponse, bool, error) {
+	if c == nil {
+		return nil, false, nil
+	}
+	raw, err := os.ReadFile(c.path(key))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	var entry diskCacheEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		_ = os.Remove(c.path(key))
+		return nil, false, nil
+	}
+	if entry.Data == nil {
+		return nil, false, nil
+	}
+	if time.Since(time.UnixMilli(entry.StoredAt)) > c.ttl {
+		_ = os.Remove(c.path(key))
+		return nil, false, nil
+	}
+	out := *entry.Data
+	out.CachedResult = true
+	return &out, true, nil
+}
+
+func (c *diskProjectionCache) Set(ctx context.Context, key string, value *PointsResponse) error {
+	if c == nil || value == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(diskCacheEntry{StoredAt: time.Now().UnixMilli(), Data: value})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(c.dir, "projection-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(encoded); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, c.path(key)); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if c.writes.Add(1)%64 == 0 {
+		c.prune()
+	}
+	return nil
+}
+
+func (c *diskProjectionCache) prune() {
+	if c == nil {
+		return
+	}
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return
+	}
+	type cachedFile struct {
+		path    string
+		modTime time.Time
+		size    int64
+	}
+	files := make([]cachedFile, 0, len(entries))
+	var total int64
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		full := filepath.Join(c.dir, entry.Name())
+		if time.Since(info.ModTime()) > c.ttl {
+			_ = os.Remove(full)
+			continue
+		}
+		files = append(files, cachedFile{path: full, modTime: info.ModTime(), size: info.Size()})
+		total += info.Size()
+	}
+	if total <= c.maxBytes {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	for _, file := range files {
+		if total <= c.maxBytes {
+			return
+		}
+		if err := os.Remove(file.path); err == nil {
+			total -= file.size
+		}
+	}
+}
+
+func (c *diskProjectionCache) label() string {
+	if c == nil {
+		return "disk"
+	}
+	return "disk:" + c.dir
+}
+
+type tieredProjectionCache struct {
+	backends []projectionCache
+}
+
+func (c *tieredProjectionCache) Get(ctx context.Context, key string) (*PointsResponse, bool, error) {
+	var firstErr error
+	for _, backend := range c.backends {
+		if backend == nil {
+			continue
+		}
+		value, ok, err := backend.Get(ctx, key)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if ok && value != nil {
+			return value, true, nil
+		}
+	}
+	return nil, false, firstErr
+}
+
+func (c *tieredProjectionCache) Set(ctx context.Context, key string, value *PointsResponse) error {
+	var firstErr error
+	for _, backend := range c.backends {
+		if backend == nil {
+			continue
+		}
+		if err := backend.Set(ctx, key, value); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// ── Projection concurrency control ────────────────────────────────────────────
+
+var errProjectionBusy = errors.New("projection capacity exhausted")
+
+type projectionGuard struct {
+	slots        chan struct{}
+	queueTimeout time.Duration
+}
+
+func defaultProjectionSlots() int {
+	if raw := strings.TrimSpace(os.Getenv("VECTORVIEW_MAX_PROJECTIONS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	n := runtime.NumCPU() / 2
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+func defaultProjectionQueueTimeout() time.Duration {
+	seconds, err := strconv.Atoi(strings.TrimSpace(envOr("VECTORVIEW_PROJECTION_QUEUE_SECONDS", "30")))
+	if err != nil || seconds <= 0 {
+		seconds = 30
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func newProjectionGuard(slots int, queueTimeout time.Duration) *projectionGuard {
+	if slots <= 0 {
+		slots = 1
+	}
+	if queueTimeout <= 0 {
+		queueTimeout = 30 * time.Second
+	}
+	return &projectionGuard{slots: make(chan struct{}, slots), queueTimeout: queueTimeout}
+}
+
+func (g *projectionGuard) capacity() int {
+	if g == nil {
+		return 0
+	}
+	return cap(g.slots)
+}
+
+func (g *projectionGuard) inUse() int {
+	if g == nil {
+		return 0
+	}
+	return len(g.slots)
+}
+
+func (g *projectionGuard) acquire(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+	select {
+	case g.slots <- struct{}{}:
+		return nil
+	default:
+	}
+	timer := time.NewTimer(g.queueTimeout)
+	defer timer.Stop()
+	select {
+	case g.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %v", errProjectionBusy, ctx.Err())
+	case <-timer.C:
+		return errProjectionBusy
+	}
+}
+
+func (g *projectionGuard) release() {
+	if g == nil {
+		return
+	}
+	<-g.slots
+}
+
+var projections = newProjectionGuard(defaultProjectionSlots(), defaultProjectionQueueTimeout())
+
+type projectionFlight struct {
+	done chan struct{}
+	resp PointsResponse
+	err  error
+}
+
+type projectionFlights struct {
+	mu    sync.Mutex
+	calls map[string]*projectionFlight
+}
+
+func newProjectionFlights() *projectionFlights {
+	return &projectionFlights{calls: make(map[string]*projectionFlight)}
+}
+
+func (g *projectionFlights) do(key string, fn func() (PointsResponse, error)) (PointsResponse, error) {
+	if g == nil || strings.TrimSpace(key) == "" {
+		return fn()
+	}
+	g.mu.Lock()
+	if existing, ok := g.calls[key]; ok {
+		g.mu.Unlock()
+		<-existing.done
+		return existing.resp, existing.err
+	}
+	flight := &projectionFlight{done: make(chan struct{})}
+	g.calls[key] = flight
+	g.mu.Unlock()
+
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				flight.err = fmt.Errorf("projection panic: %v", recovered)
+			}
+			g.mu.Lock()
+			delete(g.calls, key)
+			g.mu.Unlock()
+			close(flight.done)
+		}()
+		flight.resp, flight.err = fn()
+	}()
+	return flight.resp, flight.err
+}
+
+var projectionInFlight = newProjectionFlights()
 
 func minInt(a, b int) int {
 	if a < b {
@@ -1211,8 +1541,12 @@ func runGPUPCA(parent context.Context, collection string, limit int, qdrantURL, 
 	log.Printf("GPU PCA: %s %s %s %d %s", py, script, collection, limit, qdrantURL)
 	setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "starting", Done: false})
 
-	// Derive from the request context so a client disconnect cancels the
-	// subprocess instead of letting it run for the full timeout.
+	if err := projections.acquire(parent); err != nil {
+		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
+		return PointsResponse{}, err
+	}
+	defer projections.release()
+
 	ctx, cancel := context.WithTimeout(parent, 10*time.Minute)
 	defer cancel()
 
@@ -1293,7 +1627,11 @@ func runProjectionOnPoints(parent context.Context, points []QPoint, projectionMe
 	py := pythonBin()
 	script := pcaScript()
 
-	// Derive from the request context so a client disconnect cancels the worker.
+	if err := projections.acquire(parent); err != nil {
+		return PointsResponse{}, err
+	}
+	defer projections.release()
+
 	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
 
@@ -1346,6 +1684,164 @@ func runProjectionOnPoints(parent context.Context, points []QPoint, projectionMe
 	return resp, nil
 }
 
+// ── API responses ─────────────────────────────────────────────────────────────
+
+const (
+	errCodeBadRequest       = "bad_request"
+	errCodeNotFound         = "not_found"
+	errCodeMethodNotAllowed = "method_not_allowed"
+	errCodeUnauthorized     = "unauthorized"
+	errCodeInternal         = "internal"
+	errCodeQdrant           = "qdrant_unreachable"
+	errCodeProvider         = "provider_unavailable"
+	errCodeProjection       = "projection_failed"
+	errCodeSaturated        = "projection_saturated"
+)
+
+type apiErrorBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type apiErrorResponse struct {
+	Error apiErrorBody `json:"error"`
+}
+
+func writeJSONValue(w http.ResponseWriter, status int, value interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("write json response: %v", err)
+	}
+}
+
+func writeJSONError(w http.ResponseWriter, status int, code, message string) {
+	writeJSONValue(w, status, apiErrorResponse{Error: apiErrorBody{Code: code, Message: message}})
+}
+
+func writeServerError(w http.ResponseWriter, status int, code, message string, cause error) {
+	if cause != nil {
+		log.Printf("api error code=%s status=%d: %v", code, status, cause)
+	}
+	writeJSONError(w, status, code, message)
+}
+
+func writeProjectionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errProjectionBusy) {
+		writeJSONError(w, http.StatusTooManyRequests, errCodeSaturated, "too many projections in flight, retry shortly")
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		writeJSONError(w, http.StatusRequestTimeout, errCodeProjection, "projection cancelled")
+		return
+	}
+	writeServerError(w, http.StatusInternalServerError, errCodeProjection, "projection failed", err)
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+const (
+	authHeaderName  = "Authorization"
+	tokenHeaderName = "X-VectorView-Token"
+	tokenQueryName  = "token"
+)
+
+func newAuthMiddleware(token string, next http.Handler) http.Handler {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return next
+	}
+	expected := []byte(token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		setCORS(w)
+		if requestTokenMatches(r, expected) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="vectorview"`)
+		writeJSONError(w, http.StatusUnauthorized, errCodeUnauthorized, "missing or invalid access token")
+	})
+}
+
+func requestTokenMatches(r *http.Request, expected []byte) bool {
+	candidates := make([]string, 0, 3)
+	if raw := strings.TrimSpace(r.Header.Get(authHeaderName)); raw != "" {
+		if parts := strings.SplitN(raw, " ", 2); len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+			candidates = append(candidates, strings.TrimSpace(parts[1]))
+		}
+	}
+	if raw := strings.TrimSpace(r.Header.Get(tokenHeaderName)); raw != "" {
+		candidates = append(candidates, raw)
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get(tokenQueryName)); raw != "" {
+		candidates = append(candidates, raw)
+	}
+	for _, candidate := range candidates {
+		if subtle.ConstantTimeCompare([]byte(candidate), expected) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func authState(token string) string {
+	if strings.TrimSpace(token) == "" {
+		return "disabled"
+	}
+	return "bearer token required on /api/*"
+}
+
+// ── Health ────────────────────────────────────────────────────────────────────
+
+type healthQdrant struct {
+	URL       string `json:"url"`
+	Reachable bool   `json:"reachable"`
+	LatencyMS int64  `json:"latency_ms"`
+	Error     string `json:"error,omitempty"`
+}
+
+type healthProjection struct {
+	InUse    int `json:"in_use"`
+	Capacity int `json:"capacity"`
+}
+
+type healthResponse struct {
+	Status        string           `json:"status"`
+	UptimeSeconds int64            `json:"uptime_seconds"`
+	Qdrant        healthQdrant     `json:"qdrant"`
+	Caches        []string         `json:"caches"`
+	Projections   healthProjection `json:"projections"`
+}
+
+func buildHealth(ctx context.Context, q *qdrantClient, caches []string, guard *projectionGuard, started time.Time) healthResponse {
+	out := healthResponse{
+		Status:        "ok",
+		UptimeSeconds: int64(time.Since(started).Seconds()),
+		Qdrant:        healthQdrant{URL: q.base},
+		Caches:        caches,
+		Projections:   healthProjection{InUse: guard.inUse(), Capacity: guard.capacity()},
+	}
+	if out.Caches == nil {
+		out.Caches = []string{}
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	begin := time.Now()
+	_, err := q.listCollections(checkCtx)
+	out.Qdrant.LatencyMS = time.Since(begin).Milliseconds()
+	if err != nil {
+		out.Status = "degraded"
+		out.Qdrant.Error = err.Error()
+		return out
+	}
+	out.Qdrant.Reachable = true
+	return out
+}
+
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 func main() {
@@ -1372,20 +1868,47 @@ func main() {
 
 	q := newQdrant(qdrantURL, qdrantKey)
 	redisURL := strings.TrimSpace(os.Getenv("VECTORVIEW_REDIS_URL"))
+	authToken := strings.TrimSpace(os.Getenv("VECTORVIEW_TOKEN"))
+	startedAt := time.Now()
+	projections = newProjectionGuard(defaultProjectionSlots(), defaultProjectionQueueTimeout())
+
+	cacheTTLSeconds, err := strconv.Atoi(envOr("VECTORVIEW_CACHE_TTL_SECONDS", "600"))
+	if err != nil || cacheTTLSeconds <= 0 {
+		cacheTTLSeconds = 600
+	}
+	cacheTTL := time.Duration(cacheTTLSeconds) * time.Second
+	cacheMaxMB, err := strconv.ParseInt(envOr("VECTORVIEW_CACHE_MAX_MB", "512"), 10, 64)
+	if err != nil || cacheMaxMB <= 0 {
+		cacheMaxMB = 512
+	}
+
+	cacheBackends := make([]projectionCache, 0, 2)
+	cacheLabels := make([]string, 0, 2)
+	diskCache, err := newDiskProjectionCache(envOr("VECTORVIEW_CACHE_DIR", filepath.Join(".cache", "projections")), cacheTTL, cacheMaxMB<<20)
+	if err != nil {
+		log.Printf("Disk projection cache disabled: %v", err)
+	} else if diskCache != nil {
+		cacheBackends = append(cacheBackends, diskCache)
+		cacheLabels = append(cacheLabels, diskCache.label())
+		log.Printf("Projection cache enabled on disk (%s, ttl=%ds, max=%dMB)", diskCache.dir, cacheTTLSeconds, cacheMaxMB)
+	}
+	if redisURL != "" {
+		redisCache, err := newRedisProjectionCache(redisURL, cacheTTL)
+		if err != nil {
+			log.Printf("Redis projection cache disabled: %v", err)
+		} else {
+			cacheBackends = append(cacheBackends, redisCache)
+			cacheLabels = append(cacheLabels, "redis:"+redisURL)
+			log.Printf("Redis projection cache enabled (%s, ttl=%ds)", redisURL, cacheTTLSeconds)
+		}
+	}
 
 	var pointsCache projectionCache
-	if redisURL != "" {
-		cacheTTLSeconds, err := strconv.Atoi(envOr("VECTORVIEW_CACHE_TTL_SECONDS", "600"))
-		if err != nil || cacheTTLSeconds <= 0 {
-			cacheTTLSeconds = 600
-		}
-		redisCache, err := newRedisProjectionCache(redisURL, time.Duration(cacheTTLSeconds)*time.Second)
-		if err != nil {
-			log.Printf("Projection cache disabled: %v", err)
-		} else {
-			pointsCache = redisCache
-			log.Printf("Projection cache enabled via Redis (%s, ttl=%ds)", redisURL, cacheTTLSeconds)
-		}
+	switch len(cacheBackends) {
+	case 1:
+		pointsCache = cacheBackends[0]
+	case 2:
+		pointsCache = &tieredProjectionCache{backends: cacheBackends}
 	}
 
 	staticSub, err := fs.Sub(staticFiles, "static")
@@ -1457,13 +1980,22 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
 
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
+			return
+		}
+		setCORS(w)
+		writeJSONValue(w, http.StatusOK, buildHealth(r.Context(), q, cacheLabels, projections, startedAt))
+	})
+
 	// GET /api/collections
 	mux.HandleFunc("/api/collections", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
 		names, err := q.listCollections(r.Context())
 		if err != nil {
 			log.Printf("ERROR listCollections: %v", err)
-			http.Error(w, err.Error(), 500)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to list collections", err)
 			return
 		}
 		metas := make([]CollectionMeta, 0, len(names))
@@ -1490,12 +2022,12 @@ func main() {
 		setCORS(w)
 		id := strings.TrimSpace(r.URL.Query().Get("id"))
 		if id == "" {
-			http.Error(w, "id is required", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "id is required")
 			return
 		}
 		value, ok := pointsLoadProgress.Load(id)
 		if !ok {
-			http.Error(w, "progress id not found", http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, errCodeNotFound, "progress id not found")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1504,12 +2036,12 @@ func main() {
 
 	mux.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
 			return
 		}
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, errCodeInternal, "streaming unsupported")
 			return
 		}
 
@@ -1617,7 +2149,7 @@ func main() {
 
 	mux.HandleFunc("/api/ws", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
 			return
 		}
 		conn, err := wsUpgrader.Upgrade(w, r, nil)
@@ -1660,7 +2192,7 @@ func main() {
 		case http.MethodPost:
 			var req highlightRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, fmt.Sprintf("invalid request body: %v", err))
 				return
 			}
 			collection := strings.TrimSpace(req.Collection)
@@ -1675,7 +2207,7 @@ func main() {
 				ids = append(ids, id)
 			}
 			if len(ids) == 0 {
-				http.Error(w, "ids must include at least one point id", http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "ids must include at least one point id")
 				return
 			}
 			event := highlightEvent{
@@ -1715,7 +2247,7 @@ func main() {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(event)
 		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
 		}
 	})
 
@@ -1735,11 +2267,11 @@ func main() {
 		}
 		appendFrom, err := parseAppendFrom(r.URL.Query().Get("append_from"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
 			return
 		}
 		if appendFrom > limit {
-			http.Error(w, "append_from cannot exceed limit", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "append_from cannot exceed limit")
 			return
 		}
 		progressID := strings.TrimSpace(r.URL.Query().Get("progress_id"))
@@ -1747,7 +2279,7 @@ func main() {
 		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
 		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
 			return
 		}
 		cacheKey := projectionCacheKey(collection, limit, projectionMethod, vectorName)
@@ -1756,7 +2288,7 @@ func main() {
 			if cached, ok, err := pointsCache.Get(r.Context(), cacheKey); err == nil && ok && cached != nil {
 				if appendFrom > 0 {
 					if appendFrom > len(cached.Points) {
-						http.Error(w, "append_from exceeds cached total", http.StatusBadRequest)
+						writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "append_from exceeds cached total")
 						return
 					}
 					incremental := PointsResponse{
@@ -1809,11 +2341,14 @@ func main() {
 		}
 
 		log.Printf("→ /api/points collection=%s limit=%d projection=%s vector=%q", collection, limit, projectionMethod, vectorName)
-		resp, err := runGPUPCA(r.Context(), collection, limit, qdrantURL, projectionMethod, vectorName, progressID)
+		workerCtx := context.WithoutCancel(r.Context())
+		resp, err := projectionInFlight.do(cacheKey, func() (PointsResponse, error) {
+			return runGPUPCA(workerCtx, collection, limit, qdrantURL, projectionMethod, vectorName, progressID)
+		})
 		if err != nil {
 			setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
 			log.Printf("ERROR runGPUPCA: %v", err)
-			http.Error(w, err.Error(), 500)
+			writeProjectionError(w, err)
 			return
 		}
 		if pointsCache != nil {
@@ -1841,7 +2376,7 @@ func main() {
 		}
 		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
 			return
 		}
 		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
@@ -1888,17 +2423,17 @@ func main() {
 		raw, status, err := q.do(r.Context(), http.MethodPost,
 			"/collections/"+collection+"/points/scroll", sreq)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "search request failed", err)
 			return
 		}
 		if status >= 400 {
-			http.Error(w, fmt.Sprintf("qdrant %d: %s", status, string(raw)), 500)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "qdrant rejected the search request", fmt.Errorf("qdrant %d: %s", status, string(raw)))
 			return
 		}
 
 		var res scrollResult
 		if err := json.Unmarshal(raw, &res); err != nil {
-			http.Error(w, fmt.Sprintf("decode scroll: %v", err), 500)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to decode the qdrant search response", err)
 			return
 		}
 
@@ -1907,9 +2442,13 @@ func main() {
 			pts = res.Result.Points
 		}
 
-		resp, err := runProjectionOnPoints(r.Context(), pts, projectionMethod, vectorName)
+		keySearch := fmt.Sprintf("search:%s:%s:%d:%s:%q", collection, projectionMethod, limit, vectorName, queryStr)
+		workerCtx := context.WithoutCancel(r.Context())
+		resp, err := projectionInFlight.do(keySearch, func() (PointsResponse, error) {
+			return runProjectionOnPoints(workerCtx, pts, projectionMethod, vectorName)
+		})
 		if err != nil {
-			http.Error(w, fmt.Sprintf("projection failed: %v", err), http.StatusInternalServerError)
+			writeProjectionError(w, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1930,7 +2469,7 @@ func main() {
 		}
 		queryStr := strings.TrimSpace(r.URL.Query().Get("q"))
 		if queryStr == "" {
-			http.Error(w, "q is required", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "q is required")
 			return
 		}
 		limit := 120
@@ -1939,7 +2478,7 @@ func main() {
 		}
 		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
 			return
 		}
 		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
@@ -1992,11 +2531,11 @@ func main() {
 		case "ollama", "":
 			embedding, err = embedQueryWithOllama(r.Context(), ollamaURL, model, queryStr)
 		default:
-			http.Error(w, fmt.Sprintf("unsupported semantic provider: %s", provider), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, fmt.Sprintf("unsupported semantic provider: %s", provider))
 			return
 		}
 		if err != nil {
-			http.Error(w, fmt.Sprintf("embedding failed (%s/%s): %v", provider, model, err), http.StatusBadGateway)
+			writeServerError(w, http.StatusBadGateway, errCodeProvider, "embedding provider failed", err)
 			return
 		}
 
@@ -2013,11 +2552,11 @@ func main() {
 		raw, status, err := q.do(r.Context(), http.MethodPost,
 			"/collections/"+targetCollection+"/points/search", sreq)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "semantic search request failed", err)
 			return
 		}
 		if status >= 400 {
-			http.Error(w, fmt.Sprintf("qdrant %d: %s", status, string(raw)), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "qdrant rejected the semantic search request", fmt.Errorf("qdrant %d: %s", status, string(raw)))
 			return
 		}
 
@@ -2025,12 +2564,16 @@ func main() {
 			Result []QPoint `json:"result"`
 		}
 		if err := json.Unmarshal(raw, &searchRes); err != nil {
-			http.Error(w, fmt.Sprintf("decode semantic search: %v", err), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to decode the semantic search response", err)
 			return
 		}
-		resp, err := runProjectionOnPoints(r.Context(), searchRes.Result, projectionMethod, vectorName)
+		keySemantic := fmt.Sprintf("semantic:%s:%s:%s:%d:%s:%q", targetCollection, provider, model, limit, vectorName, queryStr)
+		workerCtx := context.WithoutCancel(r.Context())
+		resp, err := projectionInFlight.do(keySemantic, func() (PointsResponse, error) {
+			return runProjectionOnPoints(workerCtx, searchRes.Result, projectionMethod, vectorName)
+		})
 		if err != nil {
-			http.Error(w, fmt.Sprintf("projection failed: %v", err), http.StatusInternalServerError)
+			writeProjectionError(w, err)
 			return
 		}
 		if sourceCollection != targetCollection {
@@ -2044,36 +2587,36 @@ func main() {
 	mux.HandleFunc("/api/collections/{collection}/points/{point_id}/similar", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
 			return
 		}
 		collection := strings.TrimSpace(r.PathValue("collection"))
 		pointID := strings.TrimSpace(r.PathValue("point_id"))
 		if collection == "" || pointID == "" {
-			http.Error(w, "collection and point_id are required", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "collection and point_id are required")
 			return
 		}
 
 		limit, err := parseSimilarityLimit(r, 12)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
 			return
 		}
 
 		selected, err := q.getPointByID(r.Context(), collection, pointID)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to load the selected point", err)
 			return
 		}
 		if selected == nil {
-			http.Error(w, "selected point not found", http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, errCodeNotFound, "selected point not found")
 			return
 		}
 
 		queryVectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
 		searchVector, vectorName := pickSearchVector(selected.Vector, queryVectorName)
 		if searchVector == nil {
-			http.Error(w, "selected point has no usable vector", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "selected point has no usable vector")
 			return
 		}
 
@@ -2086,17 +2629,17 @@ func main() {
 		raw, status, err := q.do(r.Context(), http.MethodPost,
 			"/collections/"+collection+"/points/search", sreq)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "similarity search failed", err)
 			return
 		}
 		if status >= 400 {
-			http.Error(w, fmt.Sprintf("qdrant %d: %s", status, string(raw)), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "qdrant rejected the similarity search", fmt.Errorf("qdrant %d: %s", status, string(raw)))
 			return
 		}
 
 		var searchRes searchPointsResult
 		if err := json.Unmarshal(raw, &searchRes); err != nil {
-			http.Error(w, fmt.Sprintf("decode similar search: %v", err), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to decode the similarity response", err)
 			return
 		}
 
@@ -2127,41 +2670,41 @@ func main() {
 	mux.HandleFunc("/api/collections/{collection}/points/{point_id}/similar-radius", func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w)
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
 			return
 		}
 		collection := strings.TrimSpace(r.PathValue("collection"))
 		pointID := strings.TrimSpace(r.PathValue("point_id"))
 		if collection == "" || pointID == "" {
-			http.Error(w, "collection and point_id are required", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "collection and point_id are required")
 			return
 		}
 
 		radius, err := parseSimilarityRadius(r, 0.92)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
 			return
 		}
 		limit, err := parseSimilarityLimit(r, 400)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
 			return
 		}
 
 		selected, err := q.getPointByID(r.Context(), collection, pointID)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to load the selected point", err)
 			return
 		}
 		if selected == nil {
-			http.Error(w, "selected point not found", http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, errCodeNotFound, "selected point not found")
 			return
 		}
 
 		queryVectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
 		searchVector, vectorName := pickSearchVector(selected.Vector, queryVectorName)
 		if searchVector == nil {
-			http.Error(w, "selected point has no usable vector", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "selected point has no usable vector")
 			return
 		}
 
@@ -2174,17 +2717,17 @@ func main() {
 		raw, status, err := q.do(r.Context(), http.MethodPost,
 			"/collections/"+collection+"/points/search", sreq)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "radius search failed", err)
 			return
 		}
 		if status >= 400 {
-			http.Error(w, fmt.Sprintf("qdrant %d: %s", status, string(raw)), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "qdrant rejected the radius search", fmt.Errorf("qdrant %d: %s", status, string(raw)))
 			return
 		}
 
 		var searchRes searchPointsResult
 		if err := json.Unmarshal(raw, &searchRes); err != nil {
-			http.Error(w, fmt.Sprintf("decode radius search: %v", err), http.StatusInternalServerError)
+			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to decode the radius response", err)
 			return
 		}
 
@@ -2225,7 +2768,46 @@ func main() {
 	addr := ":" + port
 	log.Printf("🚀 VectorView running → http://localhost%s", addr)
 	log.Printf("   Qdrant: %s | GPU PCA script: %s | Max points: %d", qdrantURL, pcaScript(), maxPoints)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Printf("   Projection slots: %d (queue wait %ds) | Auth: %s", projections.capacity(), int(projections.queueTimeout.Seconds()), authState(authToken))
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           newAuthMiddleware(authToken, mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+	srv.BaseContext = func(net.Listener) context.Context { return baseCtx }
+
+	shutdownCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	case <-shutdownCtx.Done():
+		log.Printf("Shutdown requested, draining connections…")
+		cancelBase()
+		drainCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(drainCtx); err != nil {
+			log.Printf("Graceful shutdown incomplete: %v", err)
+			_ = srv.Close()
+		}
+	}
+
+	streamCancel()
+	log.Printf("VectorView stopped")
 }
 
 // ── Inline Go PCA for small search result sets ────────────────────────────────

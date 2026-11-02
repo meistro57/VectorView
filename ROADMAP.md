@@ -97,7 +97,7 @@ This document tracks where VectorView is headed. Items are roughly ordered by pr
 
 ## 🌐 v1.0 — Production Ready
 
-- [ ] **Auth layer** — optional bearer token or basic auth for public-facing deployments
+- [x] **Auth layer** — optional bearer token (`VECTORVIEW_TOKEN`) gates `/api/*` for public-facing deployments; basic auth not implemented
 - [ ] **Docker image** — `docker run -e QDRANT_URL=... meistro57/vectorview`
 - [ ] **Systemd unit file** — run as a background service on Pop!_OS
 - [ ] **Multi-user sessions** — separate view state per browser session

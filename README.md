@@ -158,9 +158,18 @@ VECTORVIEW_PORT=7433
 # PCA is O(n × dim) — keep this sane for large collections
 VECTORVIEW_MAX_POINTS=2000
 
-# Optional Redis projection cache (recommended for instant reloads)
+# Projection cache: disk cache is always on, Redis layers on top when configured
 VECTORVIEW_REDIS_URL=
 VECTORVIEW_CACHE_TTL_SECONDS=600
+VECTORVIEW_CACHE_DIR=.cache/projections
+VECTORVIEW_CACHE_MAX_MB=512
+
+# Projection worker concurrency (default NumCPU/2) and queue wait before HTTP 429
+VECTORVIEW_MAX_PROJECTIONS=4
+VECTORVIEW_PROJECTION_QUEUE_SECONDS=30
+
+# Optional bearer token; when set, /api/* requires a token
+VECTORVIEW_TOKEN=
 
 # Live streaming + ingest integrations
 VECTORVIEW_STREAM_HEARTBEAT_SECONDS=15
@@ -292,6 +301,7 @@ POST /api/highlight                                                             
 GET  /api/highlight?collection=X&since=event_id                                     → poll latest external highlight event (204 when unchanged)
 GET  /api/stream?collection=X&heartbeat_seconds=N&replay=K&max_events_per_second=M  → SSE stream for ingest/highlight/telemetry with optional replay + server-side throttling
 GET  /api/ws                                                                         → WebSocket heartbeat endpoint (server ping frames)
+GET  /healthz                                                                        → Qdrant reachability, cache backends, projection slot usage (no auth)
 
 `/api/stream` notes:
 - `replay=K` replays up to `K` most recent events from Redis Streams (`VECTORVIEW_REDIS_STREAM_KEY`) before live events.

@@ -957,6 +957,41 @@
 import * as THREE from 'three';
 import { ConvexGeometry } from 'three/examples/jsm/geometries/ConvexGeometry.js';
 
+// ── API access token + error envelope helpers ─────────────────────────────────
+const AUTH_TOKEN = (() => {
+  const params = new URLSearchParams(window.location.search);
+  const fromUrl = (params.get('token') || '').trim();
+  if (fromUrl) {
+    try { localStorage.setItem('vectorview_token', fromUrl); } catch (err) { /* storage unavailable */ }
+    return fromUrl;
+  }
+  try { return (localStorage.getItem('vectorview_token') || '').trim(); } catch (err) { return ''; }
+})();
+
+if (AUTH_TOKEN) {
+  const baseFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    const options = init ? { ...init } : {};
+    const headers = new Headers(options.headers || {});
+    if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${AUTH_TOKEN}`);
+    options.headers = headers;
+    return baseFetch(input, options);
+  };
+}
+
+async function readApiError(res, fallback) {
+  let text = '';
+  try { text = await res.text(); } catch (err) { return fallback; }
+  if (text) {
+    try {
+      const parsed = JSON.parse(text);
+      const message = parsed && parsed.error && parsed.error.message;
+      if (message) return message;
+    } catch (err) { /* not a json envelope */ }
+  }
+  return text || fallback;
+}
+
 // ── OrbitControls (inline, r128 compatible) ───────────────────────────────────
 class OrbitControls {
   constructor(camera, domElement) {
@@ -1992,7 +2027,7 @@ async function syncLiveIngestPoints() {
     const vectorQuery = selectedVectorName ? `&vector_name=${encodeURIComponent(selectedVectorName)}` : '';
     const res = await fetch(`/api/points?collection=${encodeURIComponent(currentCollection)}&limit=${nextLimit}&projection=${encodeURIComponent(projectionMethod)}${vectorQuery}&append_from=${appendFrom}`);
     if (!res.ok) {
-      const message = await res.text();
+      const message = await readApiError(res, '');
       throw new Error(message || 'incremental live sync failed');
     }
     const data = await res.json();
@@ -3192,7 +3227,7 @@ async function runFindSimilar() {
     const vectorQuery = selectedVectorName ? `&vector_name=${encodeURIComponent(selectedVectorName)}` : '';
     const res = await fetch(`/api/collections/${encodeURIComponent(currentCollection)}/points/${encodeURIComponent(selectedPointID)}/similar?limit=12${vectorQuery}`);
     if (!res.ok) {
-      const message = await res.text();
+      const message = await readApiError(res, '');
       throw new Error(message || 'similar search failed');
     }
 
@@ -3225,7 +3260,7 @@ async function runSimilarityRadius() {
     const vectorQuery = selectedVectorName ? `&vector_name=${encodeURIComponent(selectedVectorName)}` : '';
     const res = await fetch(`/api/collections/${encodeURIComponent(currentCollection)}/points/${encodeURIComponent(selectedPointID)}/similar-radius?radius=${encodeURIComponent(similarityRadius.toFixed(2))}&limit=400${vectorQuery}`);
     if (!res.ok) {
-      const message = await res.text();
+      const message = await readApiError(res, '');
       throw new Error(message || 'radius scan failed');
     }
 
@@ -3302,7 +3337,7 @@ async function pollExternalHighlight() {
     const res = await fetch(`/api/highlight?collection=${encodeURIComponent(currentCollection)}${sinceQuery}`);
     if (res.status === 204) return;
     if (!res.ok) {
-      const message = await res.text();
+      const message = await readApiError(res, '');
       throw new Error(message || 'highlight poll failed');
     }
     const event = await res.json();
@@ -3395,7 +3430,7 @@ async function loadCollections() {
   try {
     const res = await fetch('/api/collections');
     if (!res.ok) {
-      const message = await res.text();
+      const message = await readApiError(res, '');
       throw new Error(message || 'failed to load collections');
     }
     const cols = await res.json();
@@ -3494,7 +3529,7 @@ async function loadPoints(collection, limit = pointLimit) {
     const appendQuery = appendFrom > 0 ? `&append_from=${appendFrom}` : '';
     const res = await fetch(`/api/points?collection=${encodeURIComponent(collection)}&limit=${limit}&projection=${encodeURIComponent(projectionMethod)}&progress_id=${encodeURIComponent(progressID)}${vectorQuery}${appendQuery}`);
     if (!res.ok) {
-      const message = await res.text();
+      const message = await readApiError(res, '');
       throw new Error(message || 'failed to load points');
     }
     const data = await res.json();
@@ -3539,7 +3574,7 @@ async function doSearch() {
     const targetQuery = crossTarget ? `&target_collection=${encodeURIComponent(crossTarget)}` : '';
     const res = await fetch(`${endpoint}?collection=${encodeURIComponent(currentCollection)}&q=${encodeURIComponent(q)}&limit=${limit}&projection=${encodeURIComponent(projectionMethod)}${vectorQuery}${targetQuery}`);
     if (!res.ok) {
-      const message = await res.text();
+      const message = await readApiError(res, '');
       throw new Error(message || 'search failed');
     }
     const data = await res.json();
