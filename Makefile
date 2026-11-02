@@ -1,4 +1,7 @@
-.PHONY: run build tidy test python-test fmt vet docker-build docker-up docker-down
+.PHONY: start run build tidy test python-test fmt vet docker-build docker-up docker-down
+
+start:
+	./run.sh
 
 run:
 	go run .

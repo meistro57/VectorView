@@ -167,8 +167,12 @@ let selectedVectorName = '';
 let pointLimit = 2000;
 let pointSize = 6.0;
 let sizeField = 'none';
-let colorField = 'source';
+let colorField = 'auto';
+let colorFieldResolved = 'source';
 let colorFieldCustom = '';
+let pointColorOverrides = null;
+let pointTimeValues = null;
+let timeGradientRange = null;
 let coreOpacity = 0.85;
 let hazeOpacity = 0.55;
 let bloomStrength = 2.5;
@@ -262,12 +266,15 @@ let activePalette = THEMES['deep-space'].palette.slice();
 let outlierColor = new THREE.Color(THEMES['deep-space'].outlier);
 
 function getAdjustedPaletteColor(index, outColor = new THREE.Color()) {
-  outColor.setHex(activePalette[index % activePalette.length]);
+  const len = activePalette.length;
+  const safeIndex = Number.isFinite(index) ? Math.max(0, Math.floor(index)) : 0;
+  const lap = Math.floor(safeIndex / len);
+  outColor.setHex(activePalette[safeIndex % len]);
   const hsl = { h: 0, s: 0, l: 0 };
   outColor.getHSL(hsl);
-  hsl.h = (hsl.h + hueShift / 360 + 1) % 1;
-  hsl.s = Math.min(1, Math.max(0, hsl.s * saturationMult));
-  hsl.l = Math.min(1, Math.max(0, hsl.l * lightnessMult));
+  hsl.h = (hsl.h + hueShift / 360 + lap * 0.11 + 1) % 1;
+  hsl.s = Math.min(1, Math.max(0, hsl.s * saturationMult * (1 - Math.min(0.45, lap * 0.12))));
+  hsl.l = Math.min(1, Math.max(0, hsl.l * lightnessMult * (1 - Math.min(0.4, lap * 0.1))));
   outColor.setHSL(hsl.h, hsl.s, hsl.l);
   return outColor;
 }
@@ -585,11 +592,15 @@ function rebuildClusterHulls(points, positions, clusterMap = activeClusterMap) {
   if (clusterHullsGroup) {
     scene.remove(clusterHullsGroup);
   }
+  if (colorFieldResolved === TIME_COLOR_FIELD) {
+    clusterHullsGroup = null;
+    return;
+  }
   clusterHullsGroup = new THREE.Group();
 
   const buckets = new Map();
   for (let i = 0; i < points.length; i++) {
-    const key = extractClusterKey(points[i]);
+    const key = extractClusterKey(points[i], colorFieldResolved);
     if (!buckets.has(key)) buckets.set(key, []);
     buckets.get(key).push(i);
   }
@@ -621,7 +632,7 @@ function rebuildClusterHulls(points, positions, clusterMap = activeClusterMap) {
       continue;
     }
     const clusterMeta = clusterMap?.get(key);
-    const paletteIndex = clusterMeta ? clusterMeta.index % activePalette.length : Math.abs(key.length) % activePalette.length;
+    const paletteIndex = clusterMeta ? clusterMeta.colorIndex : Math.abs(key.length);
     const color = getAdjustedPaletteColor(paletteIndex, new THREE.Color());
     const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
       color,
@@ -874,7 +885,7 @@ function drawExportLegend(ctx, width, height) {
   const color = new THREE.Color();
   let rowY = y + pad + captionHeight;
   for (const [key, meta] of top) {
-    getAdjustedPaletteColor(meta.index % activePalette.length, color);
+    getAdjustedPaletteColor(meta.colorIndex, color);
     ctx.fillStyle = '#' + color.getHexString();
     ctx.beginPath();
     ctx.arc(x + pad + swatch * 0.5, rowY + rowHeight * 0.5, swatch * 0.4, 0, Math.PI * 2);
@@ -944,11 +955,17 @@ function refreshPointColors() {
   if (!basePointColors || basePointColors.length !== colorAttr.array.length) {
     basePointColors = new Float32Array(colorAttr.array.length);
   }
-  for (let i = 0; i < pointClusterIndices.length; i++) {
-    getAdjustedPaletteColor(pointClusterIndices[i], c);
-    basePointColors[i * 3] = c.r;
-    basePointColors[i * 3 + 1] = c.g;
-    basePointColors[i * 3 + 2] = c.b;
+  if (pointTimeValues && pointColorOverrides) {
+    applyTimeGradientColors(basePointColors);
+  } else if (pointColorOverrides && pointColorOverrides.length === basePointColors.length) {
+    basePointColors.set(pointColorOverrides);
+  } else {
+    for (let i = 0; i < pointClusterIndices.length; i++) {
+      getAdjustedPaletteColor(pointClusterIndices[i], c);
+      basePointColors[i * 3] = c.r;
+      basePointColors[i * 3 + 1] = c.g;
+      basePointColors[i * 3 + 2] = c.b;
+    }
   }
 
   applyOutlierColors(basePointColors);
@@ -965,29 +982,34 @@ function refreshPointColors() {
 
 function recolorByField(field) {
   colorField = field;
+  colorFieldResolved = resolveColorField(allPoints, colorField);
   if (!particleSystem || !allPoints || allPoints.length === 0) return;
 
-  const clusterMap = new Map();
-  let clusterIdx = 0;
-  for (const p of allPoints) {
-    const key = extractClusterKey(p, colorField);
-    if (!clusterMap.has(key)) {
-      clusterMap.set(key, { index: clusterIdx++, count: 0 });
-    }
-    clusterMap.get(key).count++;
-  }
+  const timeGradient = colorFieldResolved === TIME_COLOR_FIELD ? buildTimeGradient(allPoints) : null;
+  pointTimeValues = timeGradient ? timeGradient.values : null;
+  pointColorOverrides = timeGradient ? new Float32Array(allPoints.length * 3) : null;
+  timeGradientRange = timeGradient ? { min: timeGradient.min, max: timeGradient.max } : null;
+  if (pointColorOverrides) applyTimeGradientColors(pointColorOverrides);
+
+  const clusterMap = pointColorOverrides ? new Map() : buildClusterMap(allPoints, colorFieldResolved);
 
   pointClusterIndices = new Array(allPoints.length);
-  for (let i = 0; i < allPoints.length; i++) {
-    const key = extractClusterKey(allPoints[i], colorField);
-    pointClusterIndices[i] = clusterMap.get(key).index % activePalette.length;
+  if (!pointColorOverrides) {
+    for (let i = 0; i < allPoints.length; i++) {
+      const key = extractClusterKey(allPoints[i], colorFieldResolved);
+      pointClusterIndices[i] = clusterMap.get(key)?.colorIndex ?? 0;
+    }
+  } else {
+    pointClusterIndices.fill(-1);
   }
 
   activeClusterMap = clusterMap;
   refreshPointColors();
 
   if (particleSystem.geometry?.attributes?.position) {
-    rebuildClusterHulls(allPoints, particleSystem.geometry.attributes.position.array, activeClusterMap);
+    const positions = particleSystem.geometry.attributes.position.array;
+    rebuildClusterHulls(allPoints, positions, activeClusterMap);
+    updateDistanceHeatmap(allPoints, activeClusterMap, positions);
   }
 }
 
@@ -1058,8 +1080,8 @@ function renderOutliersList() {
     const payload = point.payload || {};
     const title = shortText(getSignalTitle(payload, point.id), 70);
     const snippet = shortText(getSignalSnippet(payload), 100);
-    const provider = payloadLookup(payload, 'source_type', 'memory_kind', 'ai_provider') || 'signal';
-    const speaker = payloadLookup(payload, 'speaker', 'project') || '';
+    const provider = payloadLookup(payload, 'source_type', 'memory_kind', 'ai_provider', 'channel') || 'signal';
+    const speaker = payloadLookup(payload, 'speaker', 'author', 'project') || '';
 
     const item = document.createElement('div');
     item.className = 'similar-item';
@@ -1627,7 +1649,11 @@ function onClick(e) {
 }
 
 // ── Build particle cloud ──────────────────────────────────────────────────────
-function extractClusterKey(point, field = colorField) {
+const AUTO_COLOR_CANDIDATES = ['source', 'channel', 'speaker', 'author', 'memory_kind', 'source_type', 'type', 'ai_model', 'project', 'strategy'];
+const TIME_COLOR_FIELD = 'time';
+const TIME_KEY_CANDIDATES = ['ts', 'timestamp', 'created_at', 'ingested_at', 'date', 'time'];
+
+function extractClusterKey(point, field = colorFieldResolved) {
   if (field === 'source') {
     const sourceValue = payloadLookup(point.payload, 'file_source', 'attachment_filename', 'source_title', 'sources', 'source_id', 'conversation_id', 'session_id', 'project', 'source_collection', 'source_file', 'source');
     let source = '';
@@ -1653,12 +1679,111 @@ function extractClusterKey(point, field = colorField) {
     return source.replace(/_/g, ' ') || 'unknown';
   }
 
+  if (field === 'channel_author') {
+    const channel = extractClusterKey(point, 'channel');
+    const author = extractClusterKey(point, 'author');
+    if (channel === 'unknown') return author;
+    if (author === 'unknown') return channel;
+    return `${channel} · ${author}`;
+  }
+
+  if (field === TIME_COLOR_FIELD) return 'unknown';
+
   const lookupKey = field === 'custom' ? (colorFieldCustom || '').trim() : field;
   if (!lookupKey) return 'unknown';
   const raw = payloadLookup(point.payload, lookupKey);
   if (raw === undefined || raw === null || raw === '') return 'unknown';
   if (Array.isArray(raw)) return raw.length > 0 ? String(raw[0]) : 'unknown';
   return String(raw);
+}
+
+function pointTimestamp(point) {
+  const stamp = parseTimestampValue(payloadLookup(point?.payload, ...TIME_KEY_CANDIDATES));
+  if (stamp === null) return null;
+  return stamp < 1e11 ? stamp * 1000 : stamp;
+}
+
+function colorFieldStats(points, field, sampleLimit = 2000) {
+  const step = Math.max(1, Math.floor((points.length || 1) / sampleLimit));
+  let total = 0;
+  let known = 0;
+  const keys = new Map();
+  for (let i = 0; i < points.length; i += step) {
+    total++;
+    const key = extractClusterKey(points[i], field);
+    if (key === 'unknown') continue;
+    known++;
+    keys.set(key, (keys.get(key) || 0) + 1);
+  }
+  return { coverage: total > 0 ? known / total : 0, distinct: keys.size, keys };
+}
+
+function resolveColorField(points, selection = colorField) {
+  const resolved = String(selection || 'auto');
+  if (resolved !== 'auto') return resolved;
+  if (!Array.isArray(points) || points.length === 0) return 'source';
+
+  let best = null;
+  for (const candidate of AUTO_COLOR_CANDIDATES) {
+    const stats = colorFieldStats(points, candidate);
+    if (!best || stats.coverage > best.coverage || (stats.coverage === best.coverage && stats.distinct > best.distinct)) {
+      best = { field: candidate, coverage: stats.coverage, distinct: stats.distinct };
+    }
+    if (stats.coverage >= 0.6 && stats.distinct >= 3 && stats.distinct <= 12) {
+      return candidate;
+    }
+  }
+  return best && best.coverage > 0 && best.distinct >= 2 ? best.field : 'source';
+}
+
+function buildClusterMap(points, field = colorFieldResolved) {
+  const counts = new Map();
+  for (const point of points) {
+    const key = extractClusterKey(point, field);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const ranked = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  const map = new Map();
+  ranked.forEach(([key, count], rank) => {
+    map.set(key, { index: rank, colorIndex: rank, count });
+  });
+  return map;
+}
+
+function buildTimeGradient(points) {
+  const n = points.length;
+  const stamps = new Float64Array(n);
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const stamp = pointTimestamp(points[i]);
+    stamps[i] = stamp === null ? NaN : stamp;
+    if (stamp === null) continue;
+    if (stamp < min) min = stamp;
+    if (stamp > max) max = stamp;
+  }
+  if (!Number.isFinite(min) || !(max > min)) return null;
+
+  const values = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    values[i] = Number.isNaN(stamps[i]) ? 0.5 : (stamps[i] - min) / (max - min);
+  }
+  return { values, min, max };
+}
+
+function applyTimeGradientColors(target) {
+  if (!pointTimeValues || !target) return;
+  const color = new THREE.Color();
+  const saturation = Math.min(1, Math.max(0, 0.9 * saturationMult));
+  for (let i = 0; i < pointTimeValues.length; i++) {
+    const t = pointTimeValues[i];
+    const hue = (0.52 + t * 0.33 + hueShift / 360 + 1) % 1;
+    const light = Math.min(1, Math.max(0, (0.46 + t * 0.14) * lightnessMult));
+    color.setHSL(hue, saturation, light);
+    target[i * 3] = color.r;
+    target[i * 3 + 1] = color.g;
+    target[i * 3 + 2] = color.b;
+  }
 }
 
 function buildParticles(points, projectionMeta = null) {
@@ -1691,15 +1816,14 @@ function buildParticles(points, projectionMeta = null) {
   const rangeZ = maxZ - minZ || 1;
   const scale = 200;
 
-  const clusterMap = new Map();
-  let clusterIdx = 0;
-  for (const p of points) {
-    const key = extractClusterKey(p);
-    if (!clusterMap.has(key)) {
-      clusterMap.set(key, { index: clusterIdx++, count: 0 });
-    }
-    clusterMap.get(key).count++;
-  }
+  colorFieldResolved = resolveColorField(points, colorField);
+  const timeGradient = colorFieldResolved === TIME_COLOR_FIELD ? buildTimeGradient(points) : null;
+  pointTimeValues = timeGradient ? timeGradient.values : null;
+  pointColorOverrides = timeGradient ? new Float32Array(n * 3) : null;
+  timeGradientRange = timeGradient ? { min: timeGradient.min, max: timeGradient.max } : null;
+  if (pointColorOverrides) applyTimeGradientColors(pointColorOverrides);
+
+  const clusterMap = pointColorOverrides ? new Map() : buildClusterMap(points, colorFieldResolved);
 
   pointClusterIndices = new Array(n);
   const c = new THREE.Color();
@@ -1709,11 +1833,18 @@ function buildParticles(points, projectionMeta = null) {
     positions[i*3+1] = ((p.y - minY) / rangeY - 0.5) * scale;
     positions[i*3+2] = ((p.z - minZ) / rangeZ - 0.5) * scale;
 
-    const key = extractClusterKey(p);
-    const ci  = clusterMap.get(key).index % activePalette.length;
-    pointClusterIndices[i] = ci;
-    getAdjustedPaletteColor(ci, c);
-    colors[i*3] = c.r; colors[i*3+1] = c.g; colors[i*3+2] = c.b;
+    if (pointColorOverrides) {
+      pointClusterIndices[i] = -1;
+      colors[i*3]   = pointColorOverrides[i*3];
+      colors[i*3+1] = pointColorOverrides[i*3+1];
+      colors[i*3+2] = pointColorOverrides[i*3+2];
+    } else {
+      const key = extractClusterKey(p, colorFieldResolved);
+      const ci  = clusterMap.get(key)?.colorIndex ?? 0;
+      pointClusterIndices[i] = ci;
+      getAdjustedPaletteColor(ci, c);
+      colors[i*3] = c.r; colors[i*3+1] = c.g; colors[i*3+2] = c.b;
+    }
 
     scanFlags[i] = 0;
     pointIndexByID.set(pointIDKey(p.id), i);
@@ -1814,27 +1945,40 @@ function autoFitCamera() {
   }
 }
 
+function formatLegendDate(ms) {
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return '?';
+  return date.toISOString().slice(0, 10);
+}
+
 function buildLegend(clusterMap) {
   const el = document.getElementById('legend');
   el.innerHTML = '';
 
-  const sorted = Array.from(clusterMap.entries())
-    .sort((a, b) => b[1].count - a[1].count);
+  if (pointColorOverrides && timeGradientRange) {
+    el.innerHTML = `<div class="legend-ramp"></div>
+      <div class="legend-ramp-labels"><span>${formatLegendDate(timeGradientRange.min)}</span><span>${formatLegendDate(timeGradientRange.max)}</span></div>
+      <div style="color:var(--dim);font-size:0.6rem">chronological (oldest → newest)</div>`;
+  } else {
+    const sorted = Array.from(clusterMap.entries())
+      .sort((a, b) => b[1].count - a[1].count);
 
-  const top = sorted.slice(0, 10);
-  const colorObj = new THREE.Color();
-  for (const [key, meta] of top) {
-    getAdjustedPaletteColor(meta.index % activePalette.length, colorObj);
-    const color = '#' + colorObj.getHexString();
-    el.innerHTML += `<div class="legend-item">
-      <div class="legend-dot" style="background:${color};box-shadow:0 0 6px ${color}"></div>
-      <span style="color:var(--text)">${escapeHTML(String(key))} <span style="color:var(--dim)">(${meta.count})</span></span>
-    </div>`;
-  }
+    const top = sorted.slice(0, 10);
+    const colorObj = new THREE.Color();
+    for (const [key, meta] of top) {
+      getAdjustedPaletteColor(meta.colorIndex, colorObj);
+      const color = '#' + colorObj.getHexString();
+      const rest = meta.colorIndex >= activePalette.length ? ' style="color:var(--dim)"' : '';
+      el.innerHTML += `<div class="legend-item"${rest} title="color slot ${meta.colorIndex + 1}">
+        <div class="legend-dot" style="background:${color};box-shadow:0 0 6px ${color}"></div>
+        <span style="color:var(--text)">${escapeHTML(String(key))} <span style="color:var(--dim)">(${meta.count})</span></span>
+      </div>`;
+    }
 
-  const remaining = sorted.length - top.length;
-  if (remaining > 0) {
-    el.innerHTML += `<div style="color:var(--dim);font-size:0.6rem">…${remaining} more</div>`;
+    const remaining = sorted.length - top.length;
+    if (remaining > 0) {
+      el.innerHTML += `<div style="color:var(--dim);font-size:0.6rem">…${remaining} more</div>`;
+    }
   }
 
   if (outlierCount > 0) {
@@ -1858,6 +2002,11 @@ function updateDistanceHeatmap(points, clusterMap, positions) {
   ctx.fillStyle = '#060b16';
   ctx.fillRect(0, 0, width, height);
 
+  if (colorFieldResolved === TIME_COLOR_FIELD) {
+    labels.textContent = 'Distance matrix needs a categorical color field.';
+    return;
+  }
+
   const topClusters = Array.from(clusterMap.entries())
     .sort((a, b) => b[1].count - a[1].count)
     .slice(0, 6)
@@ -1876,7 +2025,7 @@ function updateDistanceHeatmap(points, clusterMap, positions) {
   }
 
   for (let i = 0; i < points.length; i++) {
-    const key = extractClusterKey(points[i]);
+    const key = extractClusterKey(points[i], colorFieldResolved);
     if (!sums.has(key)) continue;
     const acc = sums.get(key);
     acc.x += positions[i * 3];
@@ -2006,7 +2155,13 @@ function shortText(value, maxLen) {
 
 function getSignalTitle(payload, fallbackID) {
   const title = payloadLookup(payload, 'source_title', 'title', 'attachment_filename', 'question', 'thought_id', 'memory_id', 'conversation_id', 'project', 'source_id', 'file_source', 'source_file');
-  return title !== undefined ? title : `Signal ${fallbackID}`;
+  if (title !== undefined) return title;
+  const author = payloadLookup(payload, 'author', 'username', 'display_name');
+  const channel = payloadLookup(payload, 'channel', 'channel_name');
+  if (author !== undefined && channel !== undefined) return `${shortText(author, 40)} · ${shortText(channel, 40)}`;
+  if (author !== undefined) return String(author);
+  if (channel !== undefined) return String(channel);
+  return `Signal ${fallbackID}`;
 }
 
 function getSignalSnippet(payload) {
@@ -2125,6 +2280,23 @@ function showInspector(pt, mode = 'selected') {
   const modeLabel = mode === 'hover' ? 'HOVER' : 'SELECTED';
   let html = `<div class="insp-field"><div class="insp-key">Signal</div><div class="insp-val highlight">${modeLabel}</div></div>`;
   html += `<div class="insp-field"><div class="insp-key">ID</div><div class="insp-val highlight">${escapeHTML(pt.id)}</div></div>`;
+
+  const shown = new Set();
+  const authorValue = payloadLookup(payload, 'author', 'username', 'display_name', 'user');
+  if (authorValue !== undefined) {
+    html += `<div class="insp-field"><div class="insp-key">Posted By</div><div class="insp-val highlight">${escapeHTML(shortText(authorValue, 120))}</div></div>`;
+    shown.add('author');
+    shown.add('author_id');
+  }
+  const channelValue = payloadLookup(payload, 'channel', 'channel_name');
+  if (channelValue !== undefined) {
+    html += `<div class="insp-field"><div class="insp-key">Channel</div><div class="insp-val">${escapeHTML(shortText(channelValue, 120))}</div></div>`;
+    shown.add('channel');
+  }
+  if (payloadLookup(payload, 'timestamp', 'created_at', 'date') !== undefined) {
+    shown.add('ts');
+  }
+
   html += `<div class="insp-field"><div class="insp-key">PCA Coords</div><div class="insp-val">${pt.x.toFixed(3)}, ${pt.y.toFixed(3)}, ${pt.z.toFixed(3)}</div></div>`;
 
   const priority = [
@@ -2133,13 +2305,12 @@ function showInspector(pt, mode = 'selected') {
     'thought_id', 'memory_id', 'question', 'type', 'strategy', 'uncertainty_class',
     'importance', 'evidence_strength', 'provenance_score', 'confidence',
     'source_quote', 'evidence_summary', 'summary', 'text', 'content', 'chunk_text', 'document',
-    'claims', 'concepts', 'questions', 'tags', 'sources', 'tone', 'author',
+    'claims', 'concepts', 'questions', 'tags', 'sources', 'tone', 'author', 'channel',
     'timestamp', 'date_basis', 'approximate_date', 'awakening_phase',
     'ai_provider', 'ai_model', 'embedding_model', 'source_id', 'source_collection',
     'source_file', 'chunk_index'
   ];
   const longTextKeys = new Set(['text', 'content', 'chunk_text', 'document', 'source_quote', 'summary', 'evidence_summary', 'question', 'page_segment']);
-  const shown = new Set();
   for (const k of priority) {
     const value = payloadLookup(payload, k);
     if (value === undefined) continue;
@@ -2496,7 +2667,7 @@ function renderSimilarSignals(results) {
     const payload = row.payload || {};
     const title = shortText(getSignalTitle(payload, row.id), 80);
     const snippet = shortText(getSignalSnippet(payload), 120);
-    const source = payloadLookup(payload, 'source_title', 'attachment_filename', 'project', 'conversation_id', 'source_type', 'file_source', 'source_id', 'source_file', 'source', 'date') || 'unknown source';
+    const source = payloadLookup(payload, 'source_title', 'attachment_filename', 'project', 'conversation_id', 'channel', 'author', 'source_type', 'file_source', 'source_id', 'source_file', 'source', 'date') || 'unknown source';
     const offscreen = idx === undefined;
 
     const item = document.createElement('div');

@@ -12,6 +12,7 @@
 - If the user says "update docs and push", treat it as: update docs + commit + push.
 
 ### Run / Build / Dependency Maintenance
+- `make start` → `./run.sh` (creates `venv/` if missing, installs `requirements.txt`, rebuilds, runs the binary)
 - `make run` → runs `go run .`
 - `make build` → builds `./vectorview`
 - `make tidy` → runs `go mod tidy`
@@ -26,6 +27,7 @@
 - `python3 -m pip install -r requirements.txt`
 - `go run .`
 - `go build -o vectorview .`
+- `./run.sh` (flags: `--no-build`, env: `NO_BUILD=1`, `VECTORVIEW_VENV_DIR`; extra args are forwarded to the binary)
 
 ### Verification Command (use after changes)
 - `go test ./...`
@@ -106,7 +108,10 @@
 - Semantic search auto-detects embedding provider and model per collection (OpenRouter for FrontPocket 3072 dims, Ollama for meta_bridge 768 dims, OpenAI for 1536 dims).
 - `/api/highlight` (`POST`) stores in-memory highlight events (`ids`, optional `focus_id`) per collection for UI polling.
 - `/api/collections` includes projection status fields (`projection_ready`, `projection_note`) by probing sample vectors.
-- Frontend clustering color key is derived from `payload.file_source`, `source_title`, `attachment_filename`, `sources`, or metadata keys (`extractClusterKey`).
+- Frontend clustering color key is resolved per load: `Color By` defaults to `auto`, which samples the loaded points and keeps the first field with ≥60% coverage and 3-12 distinct values (`source` chain, then `channel`, `speaker`, `author`, `memory_kind`, `source_type`, `type`, `ai_model`, `project`, `strategy`). `time` is a special mode that bypasses clusters and paints `ts`/`timestamp` as a gradient.
+- Palette slots are ranked by cluster size (`buildClusterMap`), and `getAdjustedPaletteColor` shifts hue/dims per palette lap so clusters past `activePalette.length` never silently reuse an identical colour.
+- `getSignalTitle` falls back to `Author · Channel` (then either alone) so chat collections render readable rows in the Outliers panel and Similar Signals instead of `Signal <uuid>`.
+- `extractClusterKey` still resolves the `source` chain (`file_source`, `source_title`, `attachment_filename`, `sources`, ...) and supports composites like `channel_author`; the Signal Inspector surfaces `author` as **Posted By** and `channel` directly under the ID for chat collections.
 
 ## Gotchas / Non-obvious Behaviors
 - `pca_gpu.py` is discovered by `pcaScript()` in executable dir (using `filepath.Dir(exe)`) or fallback path `pca_gpu.py` from cwd.
@@ -140,3 +145,4 @@
 - `Makefile` — canonical developer shortcuts
 - `.env.example` — runtime configuration template
 - `requirements.txt` — Python dependencies (core `numpy`, optional projection backends commented out)
+- `run.sh` — bootstrap/run entrypoint: ensure `venv/`, install requirements, rebuild, launch `./vectorview`

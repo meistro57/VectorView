@@ -200,11 +200,26 @@
   /* Left panel — controls */
   #hud-left {
     top: 60px; left: 0;
-    width: 220px;
+    width: 300px;
+    max-height: calc(100vh - 72px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: #00f5ff66 transparent;
     border-left: none;
     border-radius: 0 4px 4px 0;
     display: flex; flex-direction: column; gap: 16px;
   }
+
+  #hud-left > * { flex-shrink: 0; }
+
+  #hud-left::-webkit-scrollbar { width: 6px; }
+  #hud-left::-webkit-scrollbar-track { background: transparent; }
+  #hud-left::-webkit-scrollbar-thumb {
+    background: #00f5ff55;
+    border-radius: 3px;
+  }
+  #hud-left::-webkit-scrollbar-thumb:hover { background: var(--neon-c); }
 
   .panel-title {
     font-family: var(--font-hud);
@@ -246,6 +261,21 @@
   .legend-dot {
     width: 10px; height: 10px; border-radius: 50%;
     flex-shrink: 0;
+  }
+
+  .legend-ramp {
+    height: 10px;
+    border-radius: 2px;
+    background: linear-gradient(90deg, hsl(187 90% 46%), hsl(306 90% 60%));
+    box-shadow: 0 0 8px #00f5ff44;
+  }
+
+  .legend-ramp-labels {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2px;
+    font-size: 0.58rem;
+    color: var(--dim);
   }
 
   .meta-grid {

@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Adaptive colouring: **Color By** defaults to `auto`, sampling the loaded points and choosing the most informative payload key (for `discord_channel_logs` that is `channel`), with explicit `channel`, `channel_author`, and `author` options. Palette slots are assigned by cluster size so the largest groups get the most distinct hues, and clusters past the palette length shift hue and dim per lap instead of silently repeating a colour.
+- `time` colour mode paints points as a chronological `ts`/`timestamp` gradient with a dated legend ramp, and the Signal Inspector surfaces a chat message's **Posted By** author and channel directly under the point ID.
+- Chat-aware list rows: when a point has no `source_title`/`title`, the Outliers panel and Similar Signals now show `Author · Channel` instead of `Signal <uuid>`, and their meta lines fall back to `channel`/`author`.
 - `GET /api/collections/{collection}/points/{point_id}` returns a point's full payload, so list responses can trim long text without losing data.
 - Adaptive live-watch polling: idle collections back off from the base interval to a 30s floor, then return to base as soon as a count changes.
 - Saved lenses: named presets capturing collection, projection, point limit, named vector, theme, color field, and camera, persisted in `localStorage`, with `#lens=` share links that restore the full view on load.
@@ -47,6 +50,7 @@ All notable changes to this project will be documented in this file.
 - GitHub Actions workflow (`.github/workflows/test.yml`) to run `go test ./...` on push and pull request.
 
 ### Changed
+- The left Controls panel is wider (300px) and scrolls on desktop, so long sections (Color By, size field, lenses, distance matrix) stay reachable on short viewports; it uses a thin themed scrollbar and keeps child sections from squashing.
 - Performance pass: `/api/collections` now parses named-vector configs (dims were reported as 0 for 9 of 30 collections), answers from a 30s catalog cache, and probes collections in parallel instead of one at a time (1.55s → ~60ms cold, ~1ms cached against a 30-collection Qdrant).
 - API and static responses are gzip-compressed when accepted (a 2,000-point load drops from 3.2 MB to ~400 KB on the wire), with immutable cache headers for `/vendor` and `/fonts`.
 - List responses trim payload strings to `VECTORVIEW_PAYLOAD_MAX_CHARS` (default 400; the inspector only rendered 120 anyway), cutting the same 2,000-point response from 3.2 MB to 1.55 MB decoded.

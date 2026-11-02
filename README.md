@@ -39,7 +39,9 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Live 3D particle cloud rendered via custom WebGL shaders — additive blending, pulsing glow, dual-layer bloom
 - Unified projection pipeline: both `/api/points` and `/api/search` use `pca_gpu.py` (PyTorch/CuPy/NumPy) with selectable `pca`, `random`, `tsne`, or `umap` modes
 - Projection auto-selects the dominant dense vector dimension and skips incompatible vectors, then returns per-axis variance metadata for HUD readout
-- Color-coded clusters, colorable by payload field via **Color By** (`ai_provider`, `ai_model`, `speaker`, `awakening_phase`, `memory_kind`, `project`, `source_type`, or any custom key) or the original source-derived clustering (`file_source`, `source_id`, `source_collection`, `source_file`, `source`) with lowercase/UPPERCASE compatibility — recolors and rebuilds hulls/legend instantly without a refetch
+- Color-coded clusters with **Auto** field detection: **Color By** probes the loaded sample and picks the most informative payload key (falling back through `channel`, `speaker`, `author`, `memory_kind`, `source_type`, `type`, `ai_model`, `project`, `strategy`), or pin any field explicitly (`ai_provider`, `ai_model`, `speaker`, `awakening_phase`, `memory_kind`, `project`, `source_type`, `channel`, `author`, `channel_author`, or any custom key) — recolors and rebuilds hulls/legend instantly without a refetch
+- Palette slots are assigned by cluster size, so the largest groups always get the most distinct hues; clusters past the palette length shift hue and dim per lap instead of silently reusing a colour
+- **Time** colour mode paints the cloud as a chronological gradient from `ts`/`timestamp` (with a dated legend ramp), which pairs with the timeline reveal slider for Discord and other log collections
 - Exponential fog, starfield background, and a subtle grid anchor the scene in deep space
 - Cluster convex hull overlays (translucent + wireframe) for dominant visible clusters
 - Density-aware fog tuning updates per load to emphasize sparse vs dense structures
@@ -107,6 +109,17 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 ```bash
 git clone https://github.com/meistro57/VectorView.git
 cd VectorView
+./run.sh
+```
+
+`run.sh` creates `venv/` if it is missing, installs `requirements.txt` into it,
+rebuilds `./vectorview`, and starts the server with `VECTORVIEW_PYTHON` pointed
+at that interpreter. Pass `--no-build` to skip the rebuild, or `NO_BUILD=1` in
+the environment.
+
+Doing it by hand instead:
+
+```bash
 go mod tidy
 python3 -m pip install -r requirements.txt
 # optional: required only for projection=tsne
@@ -263,7 +276,8 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | RADIUS SCAN | Highlight all neighbors above selected cosine threshold |
 | CLEAR SCAN | Exit highlight mode and restore normal cloud |
 | Point Count slider | Reload cloud with selected sample size (500–75,000) |
-| Color By selector | Recolor cloud by any payload field (`ai_provider`, `speaker`, custom key, etc.) without reloading |
+| Color By selector | Auto-detect the best colour key, pin a payload field (`channel`, `author`, `speaker`, `ai_provider`, custom key, ...), or use the chronological `time` gradient, all without reloading |
+| Controls panel | Scrolls on short viewports so Color By, lenses, and the distance matrix stay reachable |
 | Isolate Outliers button | Hide every non-outlier point to inspect the sparse-density stragglers alone |
 | Hue / Saturation / Lightness | Live palette remapping without reloading |
 | Hover particle | Quick preview (when no pinned signal) |
