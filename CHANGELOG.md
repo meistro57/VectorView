@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Saved lenses: named presets capturing collection, projection, point limit, named vector, theme, color field, and camera, persisted in `localStorage`, with `#lens=` share links that restore the full view on load.
+- Optional cluster legend composited into the exported screenshot (swatch, label, count, plus a `COLLECTION · PROJECTION · POINTS` caption), toggled from the top bar.
+- Web fonts (Orbitron, Share Tech Mono) are vendored under `static/fonts`, removing the last external asset request.
+- Three.js is now vendored under `static/vendor/three` (build + `ConvexGeometry`/`ConvexHull` addons) and upgraded from r128 to r160, so the embedded binary renders without any CDN access. Lighting intensities were rescaled for the modern light units and output color space is pinned to linear to preserve the existing look.
 - Camera easing: search results, neighbor scans, and external highlights glide the view to the result centroid over ~650ms, cancel on any drag/scroll, and jump instead when `prefers-reduced-motion` is set.
 - Selection history with `Alt+←` / `Alt+→` plus HUD prev/next buttons, and a bookmarks panel that pins inspected points to `localStorage` per collection.
 - Container workflow: multi-stage `Dockerfile` (static Go binary plus a numpy-enabled Python runtime, non-root, `/healthz` healthcheck), `compose.yaml` bundling Qdrant with a persistent projection-cache volume, `.dockerignore`, and `make docker-build` / `docker-up` / `docker-down` targets.
@@ -42,6 +46,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Replaced the local `max`/`minInt` helpers with Go's built-in `min`/`max`.
+- Frontend split into `static/css/app.css`, `static/js/app.js`, `static/js/shaders.js`, and `static/js/api.js`; `index.html` is now markup plus the import map (4103 → 271 lines) with no bundler or npm dependency.
+- Restored the load-progress status line, which had been dropped when the progress poller was replaced by SSE events.
 - Random projection normalization adjusted to stabilize incremental append behavior.
 - `GET /api/points` no longer re-runs the projection worker for concurrent identical requests, and its result is now written to the disk cache even when Redis is not configured.
 - API failures now return a stable error envelope instead of plain-text messages, and the UI surfaces `error.message` in the load/scan status line.

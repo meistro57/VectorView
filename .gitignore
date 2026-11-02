@@ -7,7 +7,7 @@ vectorview.exe
 *.exe
 
 # Go
-vendor/
+/vendor/
 
 # Python (from adjacent tools)
 __pycache__/

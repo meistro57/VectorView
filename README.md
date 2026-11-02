@@ -77,6 +77,8 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 - Responsive HUD collapse for narrow viewports (mobile/tablet)
 - Keyboard shortcuts: `R` reload, `Space` pause/resume rotation, `Esc` clear inspector selection, `Alt+←/→` walk selection history
 - Bookmarks: star any point to pin it in the HUD, stored locally per collection
+- Lenses: save the collection, projection, palette, and camera as a named preset, or copy a `#lens=` link that restores the whole view
+- Export legend: optional cluster legend composited into the exported PNG (swatch, label, count, collection/projection caption)
 - Camera ease: search results, neighbor scans, and external highlights glide the view to the result centroid
 - Reload button — re-pull latest vectors on demand
 - Live mode toggle — subscribe to stream events and keep a WebSocket heartbeat alive during long ingest sessions
@@ -267,6 +269,8 @@ Environment variables override `.env` — works cleanly with Docker and systemd.
 | R / Space / Esc | Reload / pause rotation / clear inspector |
 | Alt + ← / → | Walk back/forward through selection history |
 | BOOKMARK | Star the inspected point (persisted locally per collection) |
+| SAVE (Lenses) | Save collection + projection + palette + camera as a named preset |
+| LEGEND (top bar) | Toggle the cluster legend in exported screenshots |
 
 ---
 
@@ -426,7 +430,14 @@ VectorView/
 ├── server.go        # server struct, route table, one method per API route
 ├── pca_gpu.py       # Python projection worker for /api/points, /api/search, /api/semantic-search (PCA/random/t-SNE/UMAP)
 ├── static/
-│   └── index.html   # Entire frontend — Three.js, GLSL shaders, HUD
+│   ├── index.html   # HUD markup + import map
+│   ├── css/app.css  # HUD/scene styles
+│   ├── js/
+│   │   ├── app.js       # UI, scene, and rendering logic
+│   │   ├── shaders.js   # GLSL for point layers and trail passes
+│   │   └── api.js       # auth token + API error helpers
+│   ├── vendor/three/    # vendored three.js + ConvexGeometry/ConvexHull (offline)
+│   └── fonts/           # vendored Orbitron + Share Tech Mono (offline)
 ├── tests/
 │   └── test_pca_gpu.py  # Projection-worker suite (unittest, numpy only)
 ├── Dockerfile       # Multi-stage image: static Go binary + numpy Python runtime

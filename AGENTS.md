@@ -89,7 +89,7 @@
 
 ## Code Organization Notes
 - Backend is a single `package main` file; shared logic is not split into packages yet.
-- Frontend has no Node/build tooling; it imports Three.js from CDN via import map.
+- Frontend has no Node/build tooling. Three.js is vendored under `static/vendor/three` and wired through the import map, so the embedded binary works offline.
 - Static assets are embedded with `//go:embed static/*`, so frontend changes require rebuilding/rerunning Go app.
 
 ## Conventions and Patterns Observed
@@ -123,7 +123,13 @@
 - `config.go` / `server.go` — configuration, route table, and handler methods
 - `Dockerfile` / `compose.yaml` — container image (app + Qdrant) and healthcheck
 - `pca_gpu.py` — full-collection PCA worker
-- `static/index.html` — all UI/rendering logic
+- `static/index.html` — HUD markup + import map
+- `static/css/app.css` — all HUD/scene styles
+- `static/js/app.js` — UI, scene, and rendering logic
+- `static/js/shaders.js` — GLSL sources for point layers and trail passes
+- `static/js/api.js` — auth token + API error-envelope helpers
+- `static/vendor/three/` — vendored three.js build and ConvexGeometry/ConvexHull addons
+- `static/fonts/` — vendored Orbitron/Share Tech Mono files referenced by `app.css`
 - `.github/workflows/test.yml` — CI test workflow (`go test ./...`)
 - `Makefile` — canonical developer shortcuts
 - `.env.example` — runtime configuration template
