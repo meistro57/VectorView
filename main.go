@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -30,7 +29,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -374,7 +372,8 @@ type loadProgress struct {
 	Error   string `json:"error,omitempty"`
 }
 
-var pointsLoadProgress sync.Map
+type progressReporter func(progressID string, progress loadProgress)
+
 var highlightEvents sync.Map
 var wsUpgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
@@ -1365,28 +1364,6 @@ func clampPercent(loaded, limit int) int {
 	return percent
 }
 
-func setLoadProgress(progressID string, progress loadProgress) {
-	if progressID == "" {
-		return
-	}
-	pointsLoadProgress.Store(progressID, progress)
-}
-
-// loadProgressRetention is how long a finished progress entry lingers so the
-// frontend can poll its terminal state before it gets swept from the map.
-const loadProgressRetention = 30 * time.Second
-
-// clearLoadProgressLater schedules deletion of a progress entry. Without this,
-// pointsLoadProgress grows by one entry per /api/points request and never shrinks.
-func clearLoadProgressLater(progressID string) {
-	if progressID == "" {
-		return
-	}
-	time.AfterFunc(loadProgressRetention, func() {
-		pointsLoadProgress.Delete(progressID)
-	})
-}
-
 func parseFetchProgressLine(line string) (int, int, bool) {
 	idx := strings.Index(line, "Fetched ")
 	if idx == -1 {
@@ -1534,15 +1511,15 @@ func startRedisTelemetryBridge(ctx context.Context, redisURL, channel string, hu
 }
 
 // runGPUPCA calls pca_gpu.py and returns projected points response
-func runGPUPCA(parent context.Context, collection string, limit int, qdrantURL, projectionMethod, vectorName, progressID string) (PointsResponse, error) {
-	py := pythonBin()
+func runGPUPCA(parent context.Context, python string, report progressReporter, collection string, limit int, qdrantURL, projectionMethod, vectorName, progressID string) (PointsResponse, error) {
+	py := python
 	script := pcaScript()
 
 	log.Printf("GPU PCA: %s %s %s %d %s", py, script, collection, limit, qdrantURL)
-	setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "starting", Done: false})
+	report(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "starting", Done: false})
 
 	if err := projections.acquire(parent); err != nil {
-		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
+		report(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
 		return PointsResponse{}, err
 	}
 	defer projections.release()
@@ -1586,7 +1563,7 @@ func runGPUPCA(parent context.Context, collection string, limit int, qdrantURL, 
 			line := scanner.Text()
 			log.Print(line)
 			if loaded, progressLimit, ok := parseFetchProgressLine(line); ok {
-				setLoadProgress(progressID, loadProgress{
+				report(progressID, loadProgress{
 					Loaded:  loaded,
 					Limit:   progressLimit,
 					Percent: clampPercent(loaded, progressLimit),
@@ -1596,7 +1573,7 @@ func runGPUPCA(parent context.Context, collection string, limit int, qdrantURL, 
 				continue
 			}
 			if strings.Contains(line, "Fetch done") {
-				setLoadProgress(progressID, loadProgress{Loaded: limit, Limit: limit, Percent: 100, Status: "projecting", Done: false})
+				report(progressID, loadProgress{Loaded: limit, Limit: limit, Percent: 100, Status: "projecting", Done: false})
 			}
 		}
 	}()
@@ -1606,25 +1583,25 @@ func runGPUPCA(parent context.Context, collection string, limit int, qdrantURL, 
 	<-stderrDone
 
 	if readErr != nil {
-		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: readErr.Error()})
+		report(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: readErr.Error()})
 		return PointsResponse{}, fmt.Errorf("read pca_gpu.py output: %w", readErr)
 	}
 	if waitErr != nil {
-		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: waitErr.Error()})
+		report(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: waitErr.Error()})
 		return PointsResponse{}, fmt.Errorf("pca_gpu.py failed: %w", waitErr)
 	}
 
 	var resp PointsResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
-		setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
+		report(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
 		return PointsResponse{}, fmt.Errorf("pca_gpu.py bad JSON: %w — output: %.300s", err, string(out))
 	}
-	setLoadProgress(progressID, loadProgress{Loaded: len(resp.Points), Limit: limit, Percent: 100, Status: "done", Done: true})
+	report(progressID, loadProgress{Loaded: len(resp.Points), Limit: limit, Percent: 100, Status: "done", Done: true})
 	return resp, nil
 }
 
-func runProjectionOnPoints(parent context.Context, points []QPoint, projectionMethod, vectorName string) (PointsResponse, error) {
-	py := pythonBin()
+func runProjectionOnPoints(parent context.Context, python string, points []QPoint, projectionMethod, vectorName string) (PointsResponse, error) {
+	py := python
 	script := pcaScript()
 
 	if err := projections.acquire(parent); err != nil {
@@ -1845,934 +1822,36 @@ func buildHealth(ctx context.Context, q *qdrantClient, caches []string, guard *p
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 func main() {
-	_ = godotenv.Load()
-	if os.Getenv("OPENROUTER_API_KEY") == "" {
-		for _, fallbackEnv := range []string{"../frontpocket/.env", "/home/mark/frontpocket/.env"} {
-			if _, err := os.Stat(fallbackEnv); err == nil {
-				_ = godotenv.Load(fallbackEnv)
-				if os.Getenv("OPENROUTER_API_KEY") != "" {
-					break
-				}
-			}
-		}
-	}
-
-	defaultCollection = envOr("VECTORVIEW_DEFAULT_COLLECTION", envOr("QDRANT_COLLECTION", defaultCollection))
-	qdrantURL := envOr("QDRANT_URL", "http://localhost:6333")
-	qdrantKey := os.Getenv("QDRANT_API_KEY")
-	port := envOr("VECTORVIEW_PORT", "7433")
-	maxPoints, _ := strconv.Atoi(envOr("VECTORVIEW_MAX_POINTS", "2000"))
-	if maxPoints <= 0 {
-		maxPoints = 2000
-	}
-
-	q := newQdrant(qdrantURL, qdrantKey)
-	redisURL := strings.TrimSpace(os.Getenv("VECTORVIEW_REDIS_URL"))
-	authToken := strings.TrimSpace(os.Getenv("VECTORVIEW_TOKEN"))
-	startedAt := time.Now()
-	projections = newProjectionGuard(defaultProjectionSlots(), defaultProjectionQueueTimeout())
-
-	cacheTTLSeconds, err := strconv.Atoi(envOr("VECTORVIEW_CACHE_TTL_SECONDS", "600"))
-	if err != nil || cacheTTLSeconds <= 0 {
-		cacheTTLSeconds = 600
-	}
-	cacheTTL := time.Duration(cacheTTLSeconds) * time.Second
-	cacheMaxMB, err := strconv.ParseInt(envOr("VECTORVIEW_CACHE_MAX_MB", "512"), 10, 64)
-	if err != nil || cacheMaxMB <= 0 {
-		cacheMaxMB = 512
-	}
-
-	cacheBackends := make([]projectionCache, 0, 2)
-	cacheLabels := make([]string, 0, 2)
-	diskCache, err := newDiskProjectionCache(envOr("VECTORVIEW_CACHE_DIR", filepath.Join(".cache", "projections")), cacheTTL, cacheMaxMB<<20)
+	cfg := loadConfig()
+	app, err := buildServer(cfg)
 	if err != nil {
-		log.Printf("Disk projection cache disabled: %v", err)
-	} else if diskCache != nil {
-		cacheBackends = append(cacheBackends, diskCache)
-		cacheLabels = append(cacheLabels, diskCache.label())
-		log.Printf("Projection cache enabled on disk (%s, ttl=%ds, max=%dMB)", diskCache.dir, cacheTTLSeconds, cacheMaxMB)
-	}
-	if redisURL != "" {
-		redisCache, err := newRedisProjectionCache(redisURL, cacheTTL)
-		if err != nil {
-			log.Printf("Redis projection cache disabled: %v", err)
-		} else {
-			cacheBackends = append(cacheBackends, redisCache)
-			cacheLabels = append(cacheLabels, "redis:"+redisURL)
-			log.Printf("Redis projection cache enabled (%s, ttl=%ds)", redisURL, cacheTTLSeconds)
-		}
+		log.Fatalf("bootstrap: %v", err)
 	}
 
-	var pointsCache projectionCache
-	switch len(cacheBackends) {
-	case 1:
-		pointsCache = cacheBackends[0]
-	case 2:
-		pointsCache = &tieredProjectionCache{backends: cacheBackends}
-	}
-
-	staticSub, err := fs.Sub(staticFiles, "static")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	semanticProvider := strings.ToLower(strings.TrimSpace(envOr("VECTORVIEW_SEMANTIC_PROVIDER", "auto")))
-	embedModel := strings.TrimSpace(envOr("VECTORVIEW_EMBED_MODEL", envOr("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")))
-	ollamaURL := strings.TrimSpace(envOr("VECTORVIEW_OLLAMA_URL", envOr("OLLAMA_BASE_URL", "http://localhost:11434")))
-
-	openrouterBaseURL := strings.TrimSpace(envOr("VECTORVIEW_OPENROUTER_BASE_URL", envOr("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")))
-	openrouterKey := strings.TrimSpace(envOr("VECTORVIEW_OPENROUTER_API_KEY", os.Getenv("OPENROUTER_API_KEY")))
-	openrouterModel := strings.TrimSpace(envOr("VECTORVIEW_OPENROUTER_MODEL", envOr("OPENROUTER_EMBEDDING_MODEL", "google/gemini-embedding-2-preview")))
-
-	openaiBaseURL := strings.TrimSpace(envOr("VECTORVIEW_OPENAI_BASE_URL", envOr("OPENAI_BASE_URL", "https://api.openai.com/v1")))
-	openaiKey := strings.TrimSpace(envOr("VECTORVIEW_OPENAI_API_KEY", os.Getenv("OPENAI_API_KEY")))
-	openaiModel := strings.TrimSpace(envOr("VECTORVIEW_OPENAI_MODEL", envOr("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")))
-
-	streamHeartbeatSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_STREAM_HEARTBEAT_SECONDS", "15"))
-	if streamHeartbeatSeconds <= 0 {
-		streamHeartbeatSeconds = 15
-	}
-	wsPingSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_WS_PING_SECONDS", "20"))
-	if wsPingSeconds <= 0 {
-		wsPingSeconds = 20
-	}
-	metaBridgeEnabled, err := strconv.ParseBool(strings.TrimSpace(envOr("VECTORVIEW_META_BRIDGE_LIVE", "true")))
-	if err != nil {
-		metaBridgeEnabled = true
-	}
-	metaBridgeCollections := strings.Split(strings.TrimSpace(envOr("VECTORVIEW_META_BRIDGE_COLLECTIONS", "mb_chunks,mb_claims")), ",")
-	metaBridgePollSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_META_BRIDGE_POLL_SECONDS", "3"))
-	if metaBridgePollSeconds <= 0 {
-		metaBridgePollSeconds = 3
-	}
-
-	frontpocketEnabled, err := strconv.ParseBool(strings.TrimSpace(envOr("VECTORVIEW_FRONTPOCKET_LIVE", "true")))
-	if err != nil {
-		frontpocketEnabled = true
-	}
-	frontpocketCollections := strings.Split(strings.TrimSpace(envOr("VECTORVIEW_FRONTPOCKET_COLLECTIONS", "frontpocket_memory,minddrill_research_thoughts,minddrill_chat_memory,fp_reflections")), ",")
-	frontpocketPollSeconds, _ := strconv.Atoi(envOr("VECTORVIEW_FRONTPOCKET_POLL_SECONDS", "3"))
-	if frontpocketPollSeconds <= 0 {
-		frontpocketPollSeconds = 3
-	}
-	redisTelemetryChannel := strings.TrimSpace(envOr("VECTORVIEW_REDIS_PUBSUB_CHANNEL", "vectorview.telemetry"))
-	streamReplayDefault, _ := strconv.Atoi(envOr("VECTORVIEW_STREAM_REPLAY_COUNT", "0"))
-	if streamReplayDefault < 0 {
-		streamReplayDefault = 0
-	}
-	streamMaxEventsPerSecond, _ := strconv.Atoi(envOr("VECTORVIEW_STREAM_MAX_EVENTS_PER_SECOND", "30"))
-	if streamMaxEventsPerSecond <= 0 {
-		streamMaxEventsPerSecond = 30
-	}
-	streamRecorderKey := strings.TrimSpace(envOr("VECTORVIEW_REDIS_STREAM_KEY", "vectorview.events"))
-	streamRecorderMaxLen, _ := strconv.ParseInt(envOr("VECTORVIEW_REDIS_STREAM_MAXLEN", "20000"), 10, 64)
-	if streamRecorderMaxLen <= 0 {
-		streamRecorderMaxLen = 20000
-	}
-	streamRecorder, err := newRedisStreamRecorder(redisURL, streamRecorderKey, streamRecorderMaxLen)
-	if err != nil {
-		log.Printf("Redis stream recorder disabled: %v", err)
-	}
-	streamHub := newStreamHub(streamRecorder)
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	defer streamCancel()
 
-	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.FS(staticSub)))
+	mux := app.routes()
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
-			return
-		}
-		setCORS(w)
-		writeJSONValue(w, http.StatusOK, buildHealth(r.Context(), q, cacheLabels, projections, startedAt))
-	})
-
-	// GET /api/collections
-	mux.HandleFunc("/api/collections", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		names, err := q.listCollections(r.Context())
-		if err != nil {
-			log.Printf("ERROR listCollections: %v", err)
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to list collections", err)
-			return
-		}
-		metas := make([]CollectionMeta, 0, len(names))
-		for _, name := range names {
-			meta := CollectionMeta{Name: name}
-			if m, err := q.collectionMeta(r.Context(), name); err == nil {
-				meta = m
-			} else {
-				meta.ProjectionReady = false
-				meta.ProjectionNote = "metadata unavailable"
-			}
-			ready, note := q.collectionProjectionStatus(r.Context(), name)
-			meta.ProjectionReady = ready
-			if note != "" {
-				meta.ProjectionNote = note
-			}
-			metas = append(metas, meta)
-		}
-		json.NewEncoder(w).Encode(metas)
-	})
-
-	// GET /api/load-progress?id=progress_id
-	mux.HandleFunc("/api/load-progress", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		id := strings.TrimSpace(r.URL.Query().Get("id"))
-		if id == "" {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "id is required")
-			return
-		}
-		value, ok := pointsLoadProgress.Load(id)
-		if !ok {
-			writeJSONError(w, http.StatusNotFound, errCodeNotFound, "progress id not found")
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(value)
-	})
-
-	mux.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
-			return
-		}
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeJSONError(w, http.StatusInternalServerError, errCodeInternal, "streaming unsupported")
-			return
-		}
-
-		collection := strings.TrimSpace(r.URL.Query().Get("collection"))
-		heartbeatSeconds, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("heartbeat_seconds")))
-		if err != nil || heartbeatSeconds <= 0 {
-			heartbeatSeconds = streamHeartbeatSeconds
-		}
-		replayCount, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("replay")))
-		if err != nil || replayCount < 0 {
-			replayCount = streamReplayDefault
-		}
-		if replayCount > 1000 {
-			replayCount = 1000
-		}
-		maxEventsPerSecond, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("max_events_per_second")))
-		if err != nil || maxEventsPerSecond <= 0 {
-			maxEventsPerSecond = streamMaxEventsPerSecond
-		}
-		if maxEventsPerSecond <= 0 {
-			maxEventsPerSecond = 1
-		}
-
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-
-		subID, stream := streamHub.subscribe(collection)
-		defer streamHub.unsubscribe(subID)
-
-		readyPayload, _ := json.Marshal(map[string]interface{}{"status": "ready", "collection": collection, "replay": replayCount, "max_events_per_second": maxEventsPerSecond})
-		if err := writeSSEEvent(w, "stream_ready", readyPayload); err != nil {
-			return
-		}
-		flusher.Flush()
-
-		if replayCount > 0 {
-			replayed, err := streamHub.replay(r.Context(), replayCount, collection)
-			if err != nil {
-				log.Printf("stream replay error: %v", err)
-			} else {
-				for _, payload := range replayed {
-					if err := writeSSEEvent(w, streamEventType(payload), payload); err != nil {
-						return
-					}
-				}
-				flusher.Flush()
-			}
-		}
-
-		heartbeatTicker := time.NewTicker(time.Duration(heartbeatSeconds) * time.Second)
-		defer heartbeatTicker.Stop()
-		rateTicker := time.NewTicker(time.Second / time.Duration(maxEventsPerSecond))
-		defer rateTicker.Stop()
-		nextSendAt := time.Now()
-		var pendingPayload []byte
-		pendingType := "event"
-
-		flushPending := func() bool {
-			if len(pendingPayload) == 0 || time.Now().Before(nextSendAt) {
-				return true
-			}
-			if err := writeSSEEvent(w, pendingType, pendingPayload); err != nil {
-				return false
-			}
-			flusher.Flush()
-			pendingPayload = nil
-			nextSendAt = time.Now().Add(time.Second / time.Duration(maxEventsPerSecond))
-			return true
-		}
-
-		for {
-			select {
-			case <-r.Context().Done():
-				return
-			case payload, ok := <-stream:
-				if !ok {
-					return
-				}
-				eventType := streamEventType(payload)
-				if time.Now().After(nextSendAt) || time.Now().Equal(nextSendAt) {
-					if err := writeSSEEvent(w, eventType, payload); err != nil {
-						return
-					}
-					flusher.Flush()
-					nextSendAt = time.Now().Add(time.Second / time.Duration(maxEventsPerSecond))
-					continue
-				}
-				pendingPayload = payload
-				pendingType = eventType
-			case <-rateTicker.C:
-				if !flushPending() {
-					return
-				}
-			case <-heartbeatTicker.C:
-				if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
-					return
-				}
-				flusher.Flush()
-			}
-		}
-	})
-
-	mux.HandleFunc("/api/ws", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
-			return
-		}
-		conn, err := wsUpgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Duration(wsPingSeconds) * time.Second))
-		conn.SetPongHandler(func(string) error {
-			return conn.SetReadDeadline(time.Now().Add(2 * time.Duration(wsPingSeconds) * time.Second))
-		})
-
-		go func() {
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					_ = conn.Close()
-					return
-				}
-			}
-		}()
-
-		ticker := time.NewTicker(time.Duration(wsPingSeconds) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-r.Context().Done():
-				return
-			case <-ticker.C:
-				deadline := time.Now().Add(5 * time.Second)
-				if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), deadline); err != nil {
-					return
-				}
-			}
-		}
-	})
-
-	mux.HandleFunc("/api/highlight", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		switch r.Method {
-		case http.MethodPost:
-			var req highlightRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, fmt.Sprintf("invalid request body: %v", err))
-				return
-			}
-			collection := strings.TrimSpace(req.Collection)
-			if collection == "" {
-				collection = defaultCollection
-			}
-			ids := make([]interface{}, 0, len(req.IDs))
-			for _, id := range req.IDs {
-				if canonicalPointID(id) == "" {
-					continue
-				}
-				ids = append(ids, id)
-			}
-			if len(ids) == 0 {
-				writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "ids must include at least one point id")
-				return
-			}
-			event := highlightEvent{
-				EventID:    strconv.FormatInt(time.Now().UnixNano(), 10),
-				Collection: collection,
-				IDs:        ids,
-				FocusID:    req.FocusID,
-				CreatedAt:  time.Now().UnixMilli(),
-			}
-			if canonicalPointID(event.FocusID) == "" {
-				event.FocusID = ids[0]
-			}
-			highlightEvents.Store(collection, event)
-			streamHub.publish("highlight", collection, event)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(event)
-		case http.MethodGet:
-			collection := strings.TrimSpace(r.URL.Query().Get("collection"))
-			if collection == "" {
-				collection = defaultCollection
-			}
-			since := strings.TrimSpace(r.URL.Query().Get("since"))
-			value, ok := highlightEvents.Load(collection)
-			if !ok {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			event, ok := value.(highlightEvent)
-			if !ok {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			if since != "" && since == event.EventID {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(event)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
-		}
-	})
-
-	// GET /api/points?collection=X&limit=N
-	// Delegates fetch+projection to pca_gpu.py and optionally serves Redis cache.
-	mux.HandleFunc("/api/points", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		collection := r.URL.Query().Get("collection")
-		if collection == "" {
-			collection = defaultCollection
-		}
-		limit := maxPoints
-		if ls := r.URL.Query().Get("limit"); ls != "" {
-			if lv, err := strconv.Atoi(ls); err == nil && lv > 0 {
-				limit = lv
-			}
-		}
-		appendFrom, err := parseAppendFrom(r.URL.Query().Get("append_from"))
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
-			return
-		}
-		if appendFrom > limit {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "append_from cannot exceed limit")
-			return
-		}
-		progressID := strings.TrimSpace(r.URL.Query().Get("progress_id"))
-		defer clearLoadProgressLater(progressID)
-		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
-		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
-			return
-		}
-		cacheKey := projectionCacheKey(collection, limit, projectionMethod, vectorName)
-
-		if pointsCache != nil {
-			if cached, ok, err := pointsCache.Get(r.Context(), cacheKey); err == nil && ok && cached != nil {
-				if appendFrom > 0 {
-					if appendFrom > len(cached.Points) {
-						writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "append_from exceeds cached total")
-						return
-					}
-					incremental := PointsResponse{
-						Points:       append([]PointData(nil), cached.Points[appendFrom:]...),
-						Total:        len(cached.Points),
-						Projection:   cached.Projection,
-						Incremental:  true,
-						AppendFrom:   appendFrom,
-						CachedResult: true,
-					}
-					json.NewEncoder(w).Encode(incremental)
-					return
-				}
-				json.NewEncoder(w).Encode(cached)
-				return
-			} else if err != nil {
-				log.Printf("projection cache read miss/error: %v", err)
-			}
-		}
-
-		if appendFrom > 0 && projectionMethod == "random" && pointsCache != nil {
-			baseKey := projectionCacheKey(collection, appendFrom, projectionMethod, vectorName)
-			if base, ok, err := pointsCache.Get(r.Context(), baseKey); err == nil && ok && base != nil && len(base.Points) == appendFrom {
-				deltaRaw, err := q.fetchPointsWindow(r.Context(), collection, appendFrom, limit-appendFrom)
-				if err == nil {
-					deltaResp, err := runProjectionOnPoints(r.Context(), deltaRaw, projectionMethod, vectorName)
-					if err == nil {
-						mergedPoints := make([]PointData, 0, len(base.Points)+len(deltaResp.Points))
-						mergedPoints = append(mergedPoints, base.Points...)
-						mergedPoints = append(mergedPoints, deltaResp.Points...)
-						merged := &PointsResponse{Points: mergedPoints, Total: len(mergedPoints), Projection: deltaResp.Projection}
-						if err := pointsCache.Set(r.Context(), cacheKey, merged); err != nil {
-							log.Printf("projection cache write error: %v", err)
-						}
-						incremental := PointsResponse{
-							Points:      append([]PointData(nil), deltaResp.Points...),
-							Total:       len(mergedPoints),
-							Projection:  deltaResp.Projection,
-							Incremental: true,
-							AppendFrom:  appendFrom,
-						}
-						json.NewEncoder(w).Encode(incremental)
-						return
-					}
-					log.Printf("incremental projection fallback (worker): %v", err)
-				} else {
-					log.Printf("incremental projection fallback (fetch): %v", err)
-				}
-			}
-		}
-
-		log.Printf("→ /api/points collection=%s limit=%d projection=%s vector=%q", collection, limit, projectionMethod, vectorName)
-		workerCtx := context.WithoutCancel(r.Context())
-		resp, err := projectionInFlight.do(cacheKey, func() (PointsResponse, error) {
-			return runGPUPCA(workerCtx, collection, limit, qdrantURL, projectionMethod, vectorName, progressID)
-		})
-		if err != nil {
-			setLoadProgress(progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
-			log.Printf("ERROR runGPUPCA: %v", err)
-			writeProjectionError(w, err)
-			return
-		}
-		if pointsCache != nil {
-			if err := pointsCache.Set(r.Context(), cacheKey, &resp); err != nil {
-				log.Printf("projection cache write error: %v", err)
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	// GET /api/search?collection=X&q=term&limit=N
-	// Payload keyword filter → GPU PCA on results
-	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		collection := r.URL.Query().Get("collection")
-		if collection == "" {
-			collection = defaultCollection
-		}
-		queryStr := r.URL.Query().Get("q")
-		limit := 500
-		if lv, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && lv > 0 {
-			limit = lv
-		}
-		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
-			return
-		}
-		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
-
-		type matchValue struct {
-			Text string `json:"text"`
-		}
-		type filterMatch struct {
-			Key   string     `json:"key"`
-			Match matchValue `json:"match"`
-		}
-		type filterClause struct {
-			Should []filterMatch `json:"should"`
-		}
-		type searchReq struct {
-			Filter      filterClause `json:"filter"`
-			Limit       int          `json:"limit"`
-			WithPayload bool         `json:"with_payload"`
-			WithVectors bool         `json:"with_vectors"`
-		}
-
-		searchableKeys := []string{
-			"text", "content", "chunk_text", "title", "source_title", "summary", "evidence_summary", "source_quote", "question",
-			"attachment_filename", "attachment_category", "project", "conversation_id", "session_id", "memory_id", "thought_id",
-			"speaker", "memory_kind", "source_type", "strategy", "uncertainty_class", "claims", "concepts", "questions", "tags",
-			"sources", "source_id", "file_source", "source_file", "tone", "author", "awakening_phase",
-			"TEXT", "CONTENT", "CHUNK_TEXT", "TITLE", "SOURCE_TITLE", "SUMMARY", "EVIDENCE_SUMMARY", "SOURCE_QUOTE", "QUESTION",
-			"ATTACHMENT_FILENAME", "ATTACHMENT_CATEGORY", "PROJECT", "CONVERSATION_ID", "SESSION_ID", "MEMORY_ID", "THOUGHT_ID",
-			"SPEAKER", "MEMORY_KIND", "SOURCE_TYPE", "STRATEGY", "UNCERTAINTY_CLASS", "CLAIMS", "CONCEPTS", "QUESTIONS", "TAGS",
-			"SOURCES", "SOURCE_ID", "FILE_SOURCE", "SOURCE_FILE", "TONE", "AUTHOR", "AWAKENING_PHASE",
-		}
-		matches := make([]filterMatch, 0, len(searchableKeys))
-		for _, key := range searchableKeys {
-			matches = append(matches, filterMatch{Key: key, Match: matchValue{Text: queryStr}})
-		}
-
-		sreq := searchReq{
-			Filter:      filterClause{Should: matches},
-			Limit:       limit,
-			WithPayload: true,
-			WithVectors: true,
-		}
-
-		raw, status, err := q.do(r.Context(), http.MethodPost,
-			"/collections/"+collection+"/points/scroll", sreq)
-		if err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "search request failed", err)
-			return
-		}
-		if status >= 400 {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "qdrant rejected the search request", fmt.Errorf("qdrant %d: %s", status, string(raw)))
-			return
-		}
-
-		var res scrollResult
-		if err := json.Unmarshal(raw, &res); err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to decode the qdrant search response", err)
-			return
-		}
-
-		var pts []QPoint
-		if res.Result != nil {
-			pts = res.Result.Points
-		}
-
-		keySearch := fmt.Sprintf("search:%s:%s:%d:%s:%q", collection, projectionMethod, limit, vectorName, queryStr)
-		workerCtx := context.WithoutCancel(r.Context())
-		resp, err := projectionInFlight.do(keySearch, func() (PointsResponse, error) {
-			return runProjectionOnPoints(workerCtx, pts, projectionMethod, vectorName)
-		})
-		if err != nil {
-			writeProjectionError(w, err)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	// GET /api/semantic-search?collection=X&target_collection=Y&q=query&limit=N
-	// Embed query text and run nearest-neighbor search in same or target collection.
-	mux.HandleFunc("/api/semantic-search", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		sourceCollection := strings.TrimSpace(r.URL.Query().Get("collection"))
-		if sourceCollection == "" {
-			sourceCollection = defaultCollection
-		}
-		targetCollection := strings.TrimSpace(r.URL.Query().Get("target_collection"))
-		if targetCollection == "" {
-			targetCollection = sourceCollection
-		}
-		queryStr := strings.TrimSpace(r.URL.Query().Get("q"))
-		if queryStr == "" {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "q is required")
-			return
-		}
-		limit := 120
-		if lv, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && lv > 0 {
-			limit = lv
-		}
-		projectionMethod, err := parseProjectionMethod(r.URL.Query().Get("projection"))
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
-			return
-		}
-		vectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
-
-		requestedProvider := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("provider")))
-		requestedModel := strings.TrimSpace(r.URL.Query().Get("model"))
-
-		provider := requestedProvider
-		model := requestedModel
-
-		detectedProvider, detectedModel, detectedDims := q.detectCollectionEmbedding(r.Context(), targetCollection)
-
-		if provider == "" || provider == "auto" {
-			if detectedProvider != "" {
-				provider = detectedProvider
-			} else if semanticProvider != "" && semanticProvider != "auto" {
-				provider = semanticProvider
-			} else {
-				if detectedDims == 3072 {
-					provider = "openrouter"
-				} else if detectedDims == 1536 {
-					provider = "openai"
-				} else {
-					provider = "ollama"
-				}
-			}
-		}
-
-		if model == "" {
-			if detectedModel != "" && (requestedProvider == "" || requestedProvider == "auto" || requestedProvider == detectedProvider) {
-				model = detectedModel
-			} else {
-				switch provider {
-				case "openrouter":
-					model = openrouterModel
-				case "openai":
-					model = openaiModel
-				default:
-					model = embedModel
-				}
-			}
-		}
-
-		var embedding []float64
-		switch provider {
-		case "openrouter":
-			embedding, err = embedQueryWithOpenRouter(r.Context(), openrouterBaseURL, openrouterKey, model, queryStr, detectedDims)
-		case "openai":
-			embedding, err = embedQueryWithOpenAI(r.Context(), openaiBaseURL, openaiKey, model, queryStr, detectedDims)
-		case "ollama", "":
-			embedding, err = embedQueryWithOllama(r.Context(), ollamaURL, model, queryStr)
-		default:
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, fmt.Sprintf("unsupported semantic provider: %s", provider))
-			return
-		}
-		if err != nil {
-			writeServerError(w, http.StatusBadGateway, errCodeProvider, "embedding provider failed", err)
-			return
-		}
-
-		queryVector := interface{}(embedding)
-		if vectorName != "" {
-			queryVector = namedSearchVector{Name: vectorName, Vector: embedding}
-		}
-		sreq := searchPointsRequest{
-			Vector:      queryVector,
-			Limit:       limit,
-			WithPayload: true,
-			WithVectors: true,
-		}
-		raw, status, err := q.do(r.Context(), http.MethodPost,
-			"/collections/"+targetCollection+"/points/search", sreq)
-		if err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "semantic search request failed", err)
-			return
-		}
-		if status >= 400 {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "qdrant rejected the semantic search request", fmt.Errorf("qdrant %d: %s", status, string(raw)))
-			return
-		}
-
-		var searchRes struct {
-			Result []QPoint `json:"result"`
-		}
-		if err := json.Unmarshal(raw, &searchRes); err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to decode the semantic search response", err)
-			return
-		}
-		keySemantic := fmt.Sprintf("semantic:%s:%s:%s:%d:%s:%q", targetCollection, provider, model, limit, vectorName, queryStr)
-		workerCtx := context.WithoutCancel(r.Context())
-		resp, err := projectionInFlight.do(keySemantic, func() (PointsResponse, error) {
-			return runProjectionOnPoints(workerCtx, searchRes.Result, projectionMethod, vectorName)
-		})
-		if err != nil {
-			writeProjectionError(w, err)
-			return
-		}
-		if sourceCollection != targetCollection {
-			log.Printf("cross-collection semantic search: source=%s target=%s q=%q hits=%d", sourceCollection, targetCollection, queryStr, len(resp.Points))
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	// GET|POST /api/collections/{collection}/points/{point_id}/similar?limit=N
-	mux.HandleFunc("/api/collections/{collection}/points/{point_id}/similar", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method != http.MethodGet && r.Method != http.MethodPost {
-			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
-			return
-		}
-		collection := strings.TrimSpace(r.PathValue("collection"))
-		pointID := strings.TrimSpace(r.PathValue("point_id"))
-		if collection == "" || pointID == "" {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "collection and point_id are required")
-			return
-		}
-
-		limit, err := parseSimilarityLimit(r, 12)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
-			return
-		}
-
-		selected, err := q.getPointByID(r.Context(), collection, pointID)
-		if err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to load the selected point", err)
-			return
-		}
-		if selected == nil {
-			writeJSONError(w, http.StatusNotFound, errCodeNotFound, "selected point not found")
-			return
-		}
-
-		queryVectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
-		searchVector, vectorName := pickSearchVector(selected.Vector, queryVectorName)
-		if searchVector == nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "selected point has no usable vector")
-			return
-		}
-
-		// Use the selected point vector directly as the Qdrant similarity query.
-		sreq := searchPointsRequest{
-			Vector:      searchVector,
-			Limit:       limit + 1,
-			WithPayload: true,
-		}
-		raw, status, err := q.do(r.Context(), http.MethodPost,
-			"/collections/"+collection+"/points/search", sreq)
-		if err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "similarity search failed", err)
-			return
-		}
-		if status >= 400 {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "qdrant rejected the similarity search", fmt.Errorf("qdrant %d: %s", status, string(raw)))
-			return
-		}
-
-		var searchRes searchPointsResult
-		if err := json.Unmarshal(raw, &searchRes); err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to decode the similarity response", err)
-			return
-		}
-
-		selectedKey := canonicalPointID(selected.ID)
-		neighbors := make([]similarNeighbor, 0, limit)
-		for _, hit := range searchRes.Result {
-			if canonicalPointID(hit.ID) == selectedKey {
-				continue
-			}
-			neighbors = append(neighbors, similarNeighbor{ID: hit.ID, Score: hit.Score, Payload: hit.Payload})
-			if len(neighbors) >= limit {
-				break
-			}
-		}
-
-		resp := similarResponse{
-			SelectedID: selected.ID,
-			Collection: collection,
-			Limit:      limit,
-			VectorName: vectorName,
-			Neighbors:  neighbors,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	// GET|POST /api/collections/{collection}/points/{point_id}/similar-radius?radius=0.92&limit=400
-	mux.HandleFunc("/api/collections/{collection}/points/{point_id}/similar-radius", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method != http.MethodGet && r.Method != http.MethodPost {
-			writeJSONError(w, http.StatusMethodNotAllowed, errCodeMethodNotAllowed, "method not allowed")
-			return
-		}
-		collection := strings.TrimSpace(r.PathValue("collection"))
-		pointID := strings.TrimSpace(r.PathValue("point_id"))
-		if collection == "" || pointID == "" {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "collection and point_id are required")
-			return
-		}
-
-		radius, err := parseSimilarityRadius(r, 0.92)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
-			return
-		}
-		limit, err := parseSimilarityLimit(r, 400)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, err.Error())
-			return
-		}
-
-		selected, err := q.getPointByID(r.Context(), collection, pointID)
-		if err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to load the selected point", err)
-			return
-		}
-		if selected == nil {
-			writeJSONError(w, http.StatusNotFound, errCodeNotFound, "selected point not found")
-			return
-		}
-
-		queryVectorName := strings.TrimSpace(r.URL.Query().Get("vector_name"))
-		searchVector, vectorName := pickSearchVector(selected.Vector, queryVectorName)
-		if searchVector == nil {
-			writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "selected point has no usable vector")
-			return
-		}
-
-		sreq := searchPointsRequest{
-			Vector:         searchVector,
-			Limit:          limit + 1,
-			WithPayload:    true,
-			ScoreThreshold: &radius,
-		}
-		raw, status, err := q.do(r.Context(), http.MethodPost,
-			"/collections/"+collection+"/points/search", sreq)
-		if err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "radius search failed", err)
-			return
-		}
-		if status >= 400 {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "qdrant rejected the radius search", fmt.Errorf("qdrant %d: %s", status, string(raw)))
-			return
-		}
-
-		var searchRes searchPointsResult
-		if err := json.Unmarshal(raw, &searchRes); err != nil {
-			writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to decode the radius response", err)
-			return
-		}
-
-		selectedKey := canonicalPointID(selected.ID)
-		neighbors := make([]similarNeighbor, 0, limit)
-		for _, hit := range searchRes.Result {
-			if canonicalPointID(hit.ID) == selectedKey {
-				continue
-			}
-			neighbors = append(neighbors, similarNeighbor{ID: hit.ID, Score: hit.Score, Payload: hit.Payload})
-			if len(neighbors) >= limit {
-				break
-			}
-		}
-
-		resp := similarResponse{
-			SelectedID:       selected.ID,
-			Collection:       collection,
-			Limit:            limit,
-			SimilarityRadius: &radius,
-			VectorName:       vectorName,
-			Neighbors:        neighbors,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	if metaBridgeEnabled {
-		startMetaBridgeWatchers(streamCtx, q, streamHub, metaBridgeCollections, time.Duration(metaBridgePollSeconds)*time.Second)
+	if cfg.metaBridgeEnabled {
+		startMetaBridgeWatchers(streamCtx, app.q, app.hub, cfg.metaBridgeCollections, time.Duration(cfg.metaBridgePollSeconds)*time.Second)
 	}
-	if frontpocketEnabled {
-		startFrontPocketWatchers(streamCtx, q, streamHub, frontpocketCollections, time.Duration(frontpocketPollSeconds)*time.Second)
+	if cfg.frontpocketEnabled {
+		startFrontPocketWatchers(streamCtx, app.q, app.hub, cfg.frontpocketCollections, time.Duration(cfg.frontpocketPollSeconds)*time.Second)
 	}
-	if redisURL := strings.TrimSpace(os.Getenv("VECTORVIEW_REDIS_URL")); redisURL != "" {
-		startRedisTelemetryBridge(streamCtx, redisURL, redisTelemetryChannel, streamHub)
+	if cfg.redisURL != "" {
+		startRedisTelemetryBridge(streamCtx, cfg.redisURL, cfg.redisTelemetryChannel, app.hub)
 	}
 
-	addr := ":" + port
+	addr := ":" + cfg.port
 	log.Printf("🚀 VectorView running → http://localhost%s", addr)
-	log.Printf("   Qdrant: %s | GPU PCA script: %s | Max points: %d", qdrantURL, pcaScript(), maxPoints)
-	log.Printf("   Projection slots: %d (queue wait %ds) | Auth: %s", projections.capacity(), int(projections.queueTimeout.Seconds()), authState(authToken))
+	if warnings := logConfigReport(streamCtx, cfg, app); warnings > 0 && cfg.strictConfig {
+		log.Fatalf("Strict config: %d warning(s) — refusing to start (unset VECTORVIEW_STRICT_CONFIG to continue)", warnings)
+	}
 
-	srv := &http.Server{
+	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           newAuthMiddleware(authToken, mux),
+		Handler:           newAuthMiddleware(cfg.authToken, mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -2780,14 +1859,14 @@ func main() {
 
 	baseCtx, cancelBase := context.WithCancel(context.Background())
 	defer cancelBase()
-	srv.BaseContext = func(net.Listener) context.Context { return baseCtx }
+	httpSrv.BaseContext = func(net.Listener) context.Context { return baseCtx }
 
 	shutdownCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- srv.ListenAndServe()
+		serveErr <- httpSrv.ListenAndServe()
 	}()
 
 	select {
@@ -2800,9 +1879,9 @@ func main() {
 		cancelBase()
 		drainCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := srv.Shutdown(drainCtx); err != nil {
+		if err := httpSrv.Shutdown(drainCtx); err != nil {
 			log.Printf("Graceful shutdown incomplete: %v", err)
-			_ = srv.Close()
+			_ = httpSrv.Close()
 		}
 	}
 

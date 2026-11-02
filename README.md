@@ -168,6 +168,15 @@ VECTORVIEW_CACHE_MAX_MB=512
 VECTORVIEW_MAX_PROJECTIONS=4
 VECTORVIEW_PROJECTION_QUEUE_SECONDS=30
 
+# Projection worker interpreter and inline fallback ceiling
+VECTORVIEW_PYTHON=
+VECTORVIEW_INLINE_PCA_MAX=2000
+# Force a specific PCA backend in the worker: auto | torch | cupy | numpy
+VECTORVIEW_PCA_BACKEND=auto
+
+# Exit non-zero when the startup config report has warnings
+VECTORVIEW_STRICT_CONFIG=false
+
 # Optional bearer token; when set, /api/* requires a token
 VECTORVIEW_TOKEN=
 
@@ -289,7 +298,6 @@ VectorView exposes a small REST API that the frontend uses — useful for script
 
 ```
 GET  /api/collections                                                             → list all Qdrant collections with metadata + projection readiness
-GET  /api/load-progress?id=progress_id                                            → live projection/fetch progress for active /api/points request
 GET  /api/points?collection=X&limit=N&projection=pca|random|tsne|umap&vector_name=V&append_from=N&progress_id=token → full projection, cache-aware load, or incremental random append
 GET  /api/search?collection=X&q=term&limit=N&projection=pca|random|tsne|umap&vector_name=V                           → payload keyword search + Python worker reprojection (mixed-case payload key support)
 GET  /api/semantic-search?collection=X&target_collection=Y&q=term&limit=N&projection=pca|random|tsne|umap&vector_name=V → embed query text via Ollama; if target_collection is set, search in that collection and project its hits
@@ -299,7 +307,7 @@ GET  /api/collections/{collection}/points/{point_id}/similar-radius?radius=R&lim
 POST /api/collections/{collection}/points/{point_id}/similar-radius               → same as above (JSON body supports {"radius": R, "limit": N})
 POST /api/highlight                                                                 → publish external highlight event ({"collection":"X","ids":[...],"focus_id":"..."})
 GET  /api/highlight?collection=X&since=event_id                                     → poll latest external highlight event (204 when unchanged)
-GET  /api/stream?collection=X&heartbeat_seconds=N&replay=K&max_events_per_second=M  → SSE stream for ingest/highlight/telemetry with optional replay + server-side throttling
+GET  /api/stream?collection=X&heartbeat_seconds=N&replay=K&max_events_per_second=M  → SSE stream for ingest/highlight/telemetry/load_progress with optional replay + server-side throttling
 GET  /api/ws                                                                         → WebSocket heartbeat endpoint (server ping frames)
 GET  /healthz                                                                        → Qdrant reachability, cache backends, projection slot usage (no auth)
 

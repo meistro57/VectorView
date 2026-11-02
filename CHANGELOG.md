@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Handler layer extracted from `main()` onto a `server` type with per-route methods, plus `httptest` coverage (collections, points, search, semantic search, highlight, similarity, health, inline fallback) backed by a fake Qdrant.
+- Inline Go PCA fallback: when `pca_gpu.py` is unavailable or fails and the requested point count is within `VECTORVIEW_INLINE_PCA_MAX`, `/api/points` projects in-process and reports `projection.method = "pca-go-fallback"` instead of failing.
+- Startup configuration report covering Qdrant reachability and latency, cache backends, projection slots, worker interpreter and available Python modules, and embedding provider keys. `VECTORVIEW_STRICT_CONFIG=1` turns warnings into a startup failure.
+- `VECTORVIEW_PYTHON` to pin the projection-worker interpreter.
+- Projection-worker test suite (`tests/test_pca_gpu.py`) with deterministic PCA/random projection checks, named-vector selection, axis padding, CLI round-trip, and a rotation-invariant golden geometry digest. `VECTORVIEW_PCA_BACKEND` pins the worker backend so tests never depend on GPU availability.
+- Load progress is now pushed over SSE as `load_progress` events; the UI's 250ms progress poller and 1500ms highlight poller are gone and `/api/load-progress` was removed.
 - On-disk projection cache (`.cache/projections` by default) keyed by collection, limit, method, and vector name, with TTL expiry, atomic writes, and a size-capped LRU prune (`VECTORVIEW_CACHE_DIR`, `VECTORVIEW_CACHE_MAX_MB`). Redis, when configured, now layers on top of the disk cache instead of replacing it.
 - Projection concurrency control: a semaphore caps simultaneous `pca_gpu.py` workers (`VECTORVIEW_MAX_PROJECTIONS`, default NumCPU/2) and waiting requests return HTTP 429 after `VECTORVIEW_PROJECTION_QUEUE_SECONDS`. Identical in-flight projections are coalesced so duplicate requests share one worker run.
 - Optional bearer-token auth for `/api/*` via `VECTORVIEW_TOKEN`, accepting `Authorization: Bearer`, `X-VectorView-Token`, or `?token=`. The frontend forwards the token automatically once supplied.
@@ -39,4 +45,5 @@ All notable changes to this project will be documented in this file.
 - Live ingest now appends new points in-place for random projection mode (with full-sync fallback for non-random projections).
 - Size-field payload lookup now resolves nested payload keys (for example nested `score` or `confidence` metadata).
 - Point Count slider upper bound increased from 20,000 to 75,000.
-- README, ROADMAP, `.env.example`, and AGENTS documentation updated for projection, caching, semantic, visual depth, API highlight triggers, projection limits, token auth, the health probe, and test requirements.
+- External highlight updates now arrive over the existing SSE stream, with a single catch-up request when the stream (re)connects.
+- README, ROADMAP, `.env.example`, and AGENTS documentation updated for projection, caching, semantic, visual depth, API highlight triggers, projection limits, token auth, the health probe, startup config validation, the inline PCA fallback, and test requirements.

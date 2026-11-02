@@ -70,39 +70,48 @@ def fetch_points(collection, limit, qdrant_url):
 
 def pca_gpu(matrix):
     """Run PCA to 3D using GPU if available, fall back to CPU."""
-    try:
-        import torch
+    backend = os.getenv("VECTORVIEW_PCA_BACKEND", "auto").strip().lower()
+    if backend not in {"auto", "torch", "cupy", "numpy"}:
+        raise ValueError(f"invalid VECTORVIEW_PCA_BACKEND: {backend!r} (expected auto, torch, cupy, numpy)")
 
-        if torch.cuda.is_available():
-            log(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
-            t = torch.tensor(matrix, dtype=torch.float32).cuda()
+    if backend in {"auto", "torch"}:
+        try:
+            import torch
+        except ImportError:
+            if backend == "torch":
+                raise RuntimeError("VECTORVIEW_PCA_BACKEND=torch requires torch installed")
+            torch = None
+        if torch is not None:
+            if torch.cuda.is_available():
+                log(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+                t = torch.tensor(matrix, dtype=torch.float32).cuda()
+                t -= t.mean(dim=0)
+                _, _, vt = torch.linalg.svd(t, full_matrices=False)
+                coords = (t @ vt[:3].T).cpu().numpy()
+                log("GPU PCA complete")
+                return coords
+
+            log("CUDA not available, using torch CPU SVD")
+            t = torch.tensor(matrix, dtype=torch.float32)
             t -= t.mean(dim=0)
             _, _, vt = torch.linalg.svd(t, full_matrices=False)
-            coords = (t @ vt[:3].T).cpu().numpy()
-            log("GPU PCA complete")
+            return (t @ vt[:3].T).numpy()
+
+    if backend in {"auto", "cupy"}:
+        try:
+            import cupy as cp
+        except ImportError:
+            if backend == "cupy":
+                raise RuntimeError("VECTORVIEW_PCA_BACKEND=cupy requires cupy installed")
+            cp = None
+        if cp is not None:
+            log("Using CuPy GPU")
+            t = cp.array(matrix, dtype=cp.float32)
+            t -= t.mean(axis=0)
+            _, _, vt = cp.linalg.svd(t, full_matrices=False)
+            coords = cp.asnumpy(t @ vt[:3].T)
+            log("CuPy PCA complete")
             return coords
-
-        log("CUDA not available, using torch CPU SVD")
-        t = torch.tensor(matrix, dtype=torch.float32)
-        t -= t.mean(dim=0)
-        _, _, vt = torch.linalg.svd(t, full_matrices=False)
-        coords = (t @ vt[:3].T).numpy()
-        return coords
-    except ImportError:
-        pass
-
-    try:
-        import cupy as cp
-
-        log("Using CuPy GPU")
-        t = cp.array(matrix, dtype=cp.float32)
-        t -= t.mean(axis=0)
-        _, _, vt = cp.linalg.svd(t, full_matrices=False)
-        coords = cp.asnumpy(t @ vt[:3].T)
-        log("CuPy PCA complete")
-        return coords
-    except ImportError:
-        pass
 
     log("Using NumPy randomized SVD (CPU)")
     matrix = matrix.astype(np.float32)

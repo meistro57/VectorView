@@ -40,6 +40,10 @@
   - `VECTORVIEW_CACHE_MAX_MB` (default `512`)
   - `VECTORVIEW_MAX_PROJECTIONS` (default `NumCPU/2`, caps concurrent projection workers)
   - `VECTORVIEW_PROJECTION_QUEUE_SECONDS` (default `30`, wait before returning HTTP 429)
+  - `VECTORVIEW_PYTHON` (projection-worker interpreter, default auto-detected venv/python3)
+  - `VECTORVIEW_INLINE_PCA_MAX` (default `2000`, point ceiling for the inline Go PCA fallback)
+  - `VECTORVIEW_PCA_BACKEND` (worker PCA backend: `auto`, `torch`, `cupy`, `numpy`; also read by `tests/test_pca_gpu.py`)
+  - `VECTORVIEW_STRICT_CONFIG` (default `false`, exit non-zero when the boot config report warns)
   - `VECTORVIEW_TOKEN` (optional; when set, `/api/*` requires `Authorization: Bearer <token>`, `X-VectorView-Token`, or `?token=`)
   - `VECTORVIEW_SEMANTIC_PROVIDER` (default `auto`, supports `auto`, `ollama`, `openrouter`, `openai`)
   - `VECTORVIEW_OLLAMA_URL` (default `http://localhost:11434`)
@@ -63,7 +67,7 @@
    - `GET /api/points?collection=&limit=&projection=&vector_name=&append_from=`
    - `GET /api/search?collection=&q=&limit=&projection=&vector_name=`
    - `GET /api/semantic-search?collection=&target_collection=&q=&limit=&projection=&vector_name=`
-   - `GET /api/highlight?collection=&since=` (poll for external highlight triggers)
+   - `GET /api/highlight?collection=&since=` (one-shot catch-up for external highlight triggers; live updates arrive over `/api/stream`)
    - `GET /healthz` (Qdrant reachability, cache backends, projection slot usage)
 3. Backend talks to Qdrant using raw HTTP (`/collections`, `/collections/{name}`, `/collections/{name}/points/scroll`, `/collections/{name}/points/search`).
 

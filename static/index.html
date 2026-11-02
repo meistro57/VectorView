@@ -1164,10 +1164,11 @@ let hoveredSimilarPointID = '';
 let poppedSimilarPointID = '';
 let scanNeighborIDs = new Set();
 let scanResults = [];
-let loadProgressPollTimer = null;
+let currentLoadCollectionLabel = '';
 let currentLoadProgressID = '';
 let currentProjectionMeta = null;
-let highlightPollTimer = null;
+let uiEventSource = null;
+let uiEventSourceCollection = '';
 let lastHighlightEventID = '';
 let liveIngestEnabled = false;
 let liveIngestSource = null;
@@ -2795,7 +2796,8 @@ function updateProjectionAxes(meta) {
     return `${component} ${percent.toFixed(1)}%`;
   });
 
-  el.textContent = labels.join(' · ');
+  const suffix = meta.method === 'pca-go-fallback' ? ' · inline Go PCA (Python worker unavailable)' : '';
+  el.textContent = labels.join(' · ') + suffix;
 }
 
 // ── Inspector ─────────────────────────────────────────────────────────────────
@@ -2888,62 +2890,14 @@ function maybeShowQdrantError(contextLabel, err) {
   }
 }
 
-function stopLoadProgressPolling() {
-  if (loadProgressPollTimer) {
-    clearInterval(loadProgressPollTimer);
-    loadProgressPollTimer = null;
-  }
+function endLoadProgress() {
   currentLoadProgressID = '';
 }
 
-function updateLoadingProgressText(progress, collectionLabel) {
-  const loadingSub = document.getElementById('loading-sub');
-  const total = Number(progress?.limit) || 0;
-  const loaded = Number(progress?.loaded) || 0;
-  const percent = Number(progress?.percent) || 0;
-  const upperCollection = String(collectionLabel || '').toUpperCase();
-
-  if (progress?.status === 'scrolling') {
-    const countText = total > 0 ? `${Math.min(loaded, total).toLocaleString()} / ${total.toLocaleString()}` : `${loaded.toLocaleString()}`;
-    loadingSub.textContent = `PULLING ${countText} VECTORS FROM ${upperCollection}… ${Math.min(99, percent)}%`;
-    setLoadStatus(`FETCH ${Math.min(99, percent)}%`, 'muted');
-    return;
-  }
-  if (progress?.status === 'projecting') {
-    loadingSub.textContent = `PROJECTING ${Math.max(loaded, total).toLocaleString()} VECTORS…`;
-    setLoadStatus('PROJECTING', 'ok');
-    return;
-  }
-  if (progress?.status === 'done') {
-    loadingSub.textContent = 'RENDERING PARTICLE CLOUD…';
-    setLoadStatus('RENDERING', 'ok');
-    return;
-  }
-  if (progress?.status === 'failed') {
-    setLoadStatus('ERROR', 'error');
-  }
-}
-
-function startLoadProgressPolling(progressID, collectionLabel) {
-  stopLoadProgressPolling();
-  if (!progressID) return;
-  currentLoadProgressID = progressID;
-
-  const poll = async () => {
-    try {
-      const res = await fetch(`/api/load-progress?id=${encodeURIComponent(progressID)}`);
-      if (!res.ok) return;
-      const progress = await res.json();
-      updateLoadingProgressText(progress, collectionLabel);
-      if (progress?.done) {
-        stopLoadProgressPolling();
-      }
-    } catch {
-    }
-  };
-
-  poll();
-  loadProgressPollTimer = setInterval(poll, 250);
+function beginLoadProgress(progressID, collectionLabel) {
+  currentLoadProgressID = progressID || '';
+  currentLoadCollectionLabel = collectionLabel || '';
+  startUIEventStream();
 }
 
 async function retryLoadFromError() {
@@ -3330,7 +3284,7 @@ function applyExternalHighlight(event) {
   updateSignalButtons();
 }
 
-async function pollExternalHighlight() {
+async function refreshExternalHighlightOnce() {
   if (!currentCollection) return;
   const sinceQuery = lastHighlightEventID ? `&since=${encodeURIComponent(lastHighlightEventID)}` : '';
   try {
@@ -3338,7 +3292,7 @@ async function pollExternalHighlight() {
     if (res.status === 204) return;
     if (!res.ok) {
       const message = await readApiError(res, '');
-      throw new Error(message || 'highlight poll failed');
+      throw new Error(message || 'highlight refresh failed');
     }
     const event = await res.json();
     const eventID = String(event?.event_id || '').trim();
@@ -3349,12 +3303,46 @@ async function pollExternalHighlight() {
   }
 }
 
-function startHighlightPolling() {
-  if (highlightPollTimer) {
-    clearInterval(highlightPollTimer);
+function startUIEventStream() {
+  if (uiEventSource && uiEventSourceCollection === currentCollection) return;
+  if (uiEventSource) {
+    uiEventSource.close();
+    uiEventSource = null;
   }
-  pollExternalHighlight();
-  highlightPollTimer = setInterval(pollExternalHighlight, 1500);
+  uiEventSourceCollection = currentCollection;
+  const source = new EventSource(`/api/stream?collection=${encodeURIComponent(currentCollection)}&max_events_per_second=30`);
+  uiEventSource = source;
+
+  source.addEventListener('stream_ready', () => {
+    if (source === uiEventSource) refreshExternalHighlightOnce();
+  });
+
+  source.addEventListener('load_progress', (event) => {
+    if (source !== uiEventSource) return;
+    let envelope;
+    try { envelope = JSON.parse(event.data); } catch { return; }
+    const payload = envelope && envelope.payload ? envelope.payload : null;
+    if (!payload) return;
+    if (currentLoadProgressID && payload.progress_id && payload.progress_id !== currentLoadProgressID) return;
+    updateLoadingProgressText(payload, currentLoadCollectionLabel);
+    if (payload.done) endLoadProgress();
+  });
+
+  source.addEventListener('highlight', (event) => {
+    if (source !== uiEventSource) return;
+    let envelope;
+    try { envelope = JSON.parse(event.data); } catch { return; }
+    const payload = envelope && envelope.payload ? envelope.payload : null;
+    if (!payload) return;
+    const eventID = String(payload.event_id || '').trim();
+    if (eventID && eventID === lastHighlightEventID) return;
+    if (eventID) lastHighlightEventID = eventID;
+    applyExternalHighlight(payload);
+  });
+
+  source.onerror = () => {
+    setScanStatus('Event stream reconnecting...', 'muted');
+  };
 }
 
 // ── Raycasting hover ──────────────────────────────────────────────────────────
@@ -3520,9 +3508,9 @@ async function loadPoints(collection, limit = pointLimit) {
 
   const progressID = `lp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   if (appendFrom > 0) {
-    stopLoadProgressPolling();
+    endLoadProgress();
   } else {
-    startLoadProgressPolling(progressID, collection);
+    beginLoadProgress(progressID, collection);
   }
   try {
     const vectorQuery = selectedVectorName ? `&vector_name=${encodeURIComponent(selectedVectorName)}` : '';
@@ -3533,7 +3521,7 @@ async function loadPoints(collection, limit = pointLimit) {
       throw new Error(message || 'failed to load points');
     }
     const data = await res.json();
-    stopLoadProgressPolling();
+    endLoadProgress();
     document.getElementById('loading-sub').textContent = 'RENDERING PARTICLE CLOUD…';
     setLoadStatus('RENDERING', 'ok');
 
@@ -3545,10 +3533,10 @@ async function loadPoints(collection, limit = pointLimit) {
     }
 
     lastHighlightEventID = '';
-    pollExternalHighlight();
+    refreshExternalHighlightOnce();
     hideErrorOverlay();
   } catch(e) {
-    stopLoadProgressPolling();
+    endLoadProgress();
     maybeShowQdrantError('Loading points failed', e);
     document.getElementById('loading-sub').textContent = 'ERROR: ' + e.message;
     setLoadStatus('ERROR', 'error');
@@ -3799,7 +3787,7 @@ async function main() {
   initScene();
   animate();
   wireControls();
-  startHighlightPolling();
+  startUIEventStream();
   await loadCollections();
   await loadPoints(currentCollection, pointLimit);
 }
