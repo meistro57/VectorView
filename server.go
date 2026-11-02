@@ -5,15 +5,46 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+const catalogConcurrency = 8
+
+type collectionCatalogCache struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	expires time.Time
+	metas   []CollectionMeta
+}
+
+func (c *collectionCatalogCache) get(now time.Time) ([]CollectionMeta, bool) {
+	if c == nil || c.ttl <= 0 {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.metas == nil || now.After(c.expires) {
+		return nil, false
+	}
+	return c.metas, true
+}
+
+func (c *collectionCatalogCache) set(now time.Time, metas []CollectionMeta) {
+	if c == nil || c.ttl <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.metas = metas
+	c.expires = now.Add(c.ttl)
+}
 
 type loadProgressEvent struct {
 	ProgressID string `json:"progress_id"`
@@ -33,11 +64,14 @@ type server struct {
 	flights     *projectionFlights
 	startedAt   time.Time
 
+	collectionCache *collectionCatalogCache
+
 	defaultCollection string
 	maxPoints         int
 	qdrantURL         string
 
 	inlinePCAFallbackMax int
+	payloadMaxChars      int
 	python               string
 
 	hub                      *streamHub
@@ -100,10 +134,12 @@ func buildServer(cfg config) (*server, error) {
 		projections:              newProjectionGuard(cfg.projectionSlots, cfg.projectionQueue),
 		flights:                  newProjectionFlights(),
 		startedAt:                time.Now(),
+		collectionCache:          &collectionCatalogCache{ttl: cfg.catalogTTL},
 		defaultCollection:        cfg.defaultCollection,
 		maxPoints:                cfg.maxPoints,
 		qdrantURL:                cfg.qdrantURL,
 		inlinePCAFallbackMax:     cfg.inlinePCAFallbackMax,
+		payloadMaxChars:          cfg.payloadMaxChars,
 		python:                   cfg.python,
 		hub:                      newStreamHub(streamRecorder),
 		streamHeartbeatSeconds:   cfg.streamHeartbeatSeconds,
@@ -123,12 +159,8 @@ func buildServer(cfg config) (*server, error) {
 }
 
 func (s *server) routes() *http.ServeMux {
-	staticSub, err := fs.Sub(staticFiles, "static")
-	if err != nil {
-		log.Fatalf("embed static assets: %v", err)
-	}
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.FS(staticSub)))
+	mux.Handle("/", staticFileHandler())
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/api/collections", s.handleCollections)
 	mux.HandleFunc("/api/stream", s.handleStream)
@@ -137,6 +169,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("/api/points", s.handlePoints)
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/semantic-search", s.handleSemanticSearch)
+	mux.HandleFunc("GET /api/collections/{collection}/points/{point_id}", s.handlePointDetail)
 	mux.HandleFunc("/api/collections/{collection}/points/{point_id}/similar", s.handleSimilar)
 	mux.HandleFunc("/api/collections/{collection}/points/{point_id}/similar-radius", s.handleSimilarRadius)
 	return mux
@@ -153,29 +186,68 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleCollections(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
-	names, err := s.q.listCollections(r.Context())
+	metas, err := s.collectionCatalog(r.Context())
 	if err != nil {
 		log.Printf("ERROR listCollections: %v", err)
 		writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to list collections", err)
 		return
 	}
-	metas := make([]CollectionMeta, 0, len(names))
-	for _, name := range names {
-		meta := CollectionMeta{Name: name}
-		if m, err := s.q.collectionMeta(r.Context(), name); err == nil {
-			meta = m
-		} else {
-			meta.ProjectionReady = false
-			meta.ProjectionNote = "metadata unavailable"
-		}
-		ready, note := s.q.collectionProjectionStatus(r.Context(), name)
+	writeJSONValue(w, http.StatusOK, metas)
+}
+
+func (s *server) collectionCatalog(ctx context.Context) ([]CollectionMeta, error) {
+	if cached, ok := s.collectionCache.get(time.Now()); ok {
+		return cached, nil
+	}
+
+	names, err := s.q.listCollections(ctx)
+	if err != nil {
+		return nil, err
+	}
+	metas := make([]CollectionMeta, len(names))
+	sem := make(chan struct{}, catalogConcurrency)
+	var wait sync.WaitGroup
+	for index, name := range names {
+		wait.Add(1)
+		go func(index int, name string) {
+			defer wait.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			metas[index] = s.describeCollection(ctx, name)
+		}(index, name)
+	}
+	wait.Wait()
+
+	s.collectionCache.set(time.Now(), metas)
+	return metas, nil
+}
+
+func (s *server) describeCollection(ctx context.Context, name string) CollectionMeta {
+	meta := CollectionMeta{Name: name}
+	if fetched, err := s.q.collectionMeta(ctx, name); err == nil {
+		meta = fetched
+		meta.Name = name
+	} else {
+		meta.ProjectionReady = false
+		meta.ProjectionNote = "metadata unavailable"
+		return meta
+	}
+
+	switch {
+	case meta.PointsCount == 0:
+		meta.ProjectionReady = true
+		meta.ProjectionNote = "empty collection"
+	case meta.VectorSize > 0:
+		meta.ProjectionReady = true
+		meta.ProjectionNote = "ok"
+	default:
+		ready, note := s.q.collectionProjectionStatus(ctx, name)
 		meta.ProjectionReady = ready
 		if note != "" {
 			meta.ProjectionNote = note
 		}
-		metas = append(metas, meta)
 	}
-	json.NewEncoder(w).Encode(metas)
+	return meta
 }
 
 func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -441,10 +513,10 @@ func (s *server) handlePoints(w http.ResponseWriter, r *http.Request) {
 					AppendFrom:   appendFrom,
 					CachedResult: true,
 				}
-				json.NewEncoder(w).Encode(incremental)
+				json.NewEncoder(w).Encode(trimPointsResponse(incremental, s.payloadMaxChars))
 				return
 			}
-			json.NewEncoder(w).Encode(cached)
+			json.NewEncoder(w).Encode(trimPointsResponse(*cached, s.payloadMaxChars))
 			return
 		} else if err != nil {
 			log.Printf("projection cache read miss/error: %v", err)
@@ -472,7 +544,7 @@ func (s *server) handlePoints(w http.ResponseWriter, r *http.Request) {
 						Incremental: true,
 						AppendFrom:  appendFrom,
 					}
-					json.NewEncoder(w).Encode(incremental)
+					json.NewEncoder(w).Encode(trimPointsResponse(incremental, s.payloadMaxChars))
 					return
 				}
 				log.Printf("incremental projection fallback (worker): %v", err)
@@ -492,7 +564,7 @@ func (s *server) handlePoints(w http.ResponseWriter, r *http.Request) {
 			log.Printf("projection worker failed (%v); served inline Go PCA for collection=%s limit=%d", err, collection, limit)
 			s.reportProgress(collection, progressID, loadProgress{Loaded: fallback.Total, Limit: limit, Percent: 100, Status: "done", Done: true})
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(fallback)
+			json.NewEncoder(w).Encode(trimPointsResponse(*fallback, s.payloadMaxChars))
 			return
 		}
 		s.reportProgress(collection, progressID, loadProgress{Loaded: 0, Limit: limit, Percent: 0, Status: "failed", Done: true, Error: err.Error()})
@@ -507,7 +579,7 @@ func (s *server) handlePoints(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(trimPointsResponse(resp, s.payloadMaxChars))
 }
 
 func (s *server) reportProgress(collection, progressID string, progress loadProgress) {
@@ -642,7 +714,7 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(trimPointsResponse(resp, s.payloadMaxChars))
 }
 
 func (s *server) handleSemanticSearch(w http.ResponseWriter, r *http.Request) {
@@ -768,7 +840,34 @@ func (s *server) handleSemanticSearch(w http.ResponseWriter, r *http.Request) {
 		log.Printf("cross-collection semantic search: source=%s target=%s q=%q hits=%d", sourceCollection, targetCollection, queryStr, len(resp.Points))
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(trimPointsResponse(resp, s.payloadMaxChars))
+}
+
+type pointDetailResponse struct {
+	ID      interface{}            `json:"id"`
+	Payload map[string]interface{} `json:"payload"`
+}
+
+func (s *server) handlePointDetail(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	collection := strings.TrimSpace(r.PathValue("collection"))
+	pointID := strings.TrimSpace(r.PathValue("point_id"))
+	if collection == "" || pointID == "" {
+		writeJSONError(w, http.StatusBadRequest, errCodeBadRequest, "collection and point_id are required")
+		return
+	}
+
+	point, err := s.q.getPointByID(r.Context(), collection, pointID)
+	if err != nil {
+		writeServerError(w, http.StatusInternalServerError, errCodeQdrant, "failed to load the selected point", err)
+		return
+	}
+	if point == nil {
+		writeJSONError(w, http.StatusNotFound, errCodeNotFound, "selected point not found")
+		return
+	}
+
+	writeJSONValue(w, http.StatusOK, pointDetailResponse{ID: point.ID, Payload: point.Payload})
 }
 
 func (s *server) handleSimilar(w http.ResponseWriter, r *http.Request) {

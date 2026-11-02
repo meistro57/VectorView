@@ -1,11 +1,14 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -68,7 +71,17 @@ func newFakeQdrant(t *testing.T) *fakeQdrant {
 		case strings.HasSuffix(r.URL.Path, "/points/search"):
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": fake.searchHit})
 		case strings.HasSuffix(r.URL.Path, "/points"):
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": fake.points})
+			var req pointsByIDRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			matches := make([]QPoint, 0, len(req.IDs))
+			for _, want := range req.IDs {
+				for _, point := range fake.points {
+					if canonicalPointID(point.ID) == canonicalPointID(want) {
+						matches = append(matches, point)
+					}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": matches})
 		default:
 			http.NotFound(w, r)
 		}
@@ -421,5 +434,259 @@ func TestLoadProgressEndpointRemoved(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/load-progress?id=anything", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404 after SSE migration", rec.Code)
+	}
+}
+
+func TestDecodeVectorParams(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw      string
+		wantSize uint64
+		wantOK   bool
+	}{
+		{"single", `{"size":3072,"distance":"Cosine"}`, 3072, true},
+		{"named", `{"text":{"size":3072,"distance":"Cosine"},"image":{"size":512,"distance":"Dot"}}`, 3072, true},
+		{"named-majority", `{"a":{"size":8,"distance":"Dot"},"b":{"size":8,"distance":"Dot"},"c":{"size":4,"distance":"Dot"}}`, 8, true},
+		{"sparse-only", `{"sparse":{"index":{"on_disk":false}}}`, 0, false},
+		{"null", `null`, 0, false},
+		{"empty", ``, 0, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			size, _, ok := decodeVectorParams(json.RawMessage(c.raw))
+			if ok != c.wantOK || size != c.wantSize {
+				t.Fatalf("decodeVectorParams(%s) = (%d, ok=%v), want (%d, ok=%v)", c.raw, size, ok, c.wantSize, c.wantOK)
+			}
+		})
+	}
+}
+
+func TestTruncateTextIsRuneSafe(t *testing.T) {
+	if got := truncateText("héllo wörld", 5); got != "héllo…" {
+		t.Errorf("truncateText = %q, want %q", got, "héllo…")
+	}
+	if got := truncateText("short", 100); got != "short" {
+		t.Errorf("truncateText = %q, want short", got)
+	}
+	if got := truncateText("anything", 0); got != "anything" {
+		t.Errorf("truncateText with 0 budget = %q, want unchanged", got)
+	}
+}
+
+func TestTrimPointsResponse(t *testing.T) {
+	long := strings.Repeat("doc ", 200)
+	response := PointsResponse{
+		Points: []PointData{
+			{ID: "p1", Payload: map[string]interface{}{"document": long, "score": 0.5}},
+			{ID: "p2", Payload: map[string]interface{}{"text": "short", "tags": []interface{}{long, "ok"}}},
+			{ID: "p3", Payload: nil},
+		},
+		Total: 3,
+	}
+
+	trimmed := trimPointsResponse(response, 400)
+
+	if trimmed.Points[0].Payload["score"] != 0.5 {
+		t.Error("numeric payload values must survive trimming")
+	}
+	if doc, _ := trimmed.Points[0].Payload["document"].(string); len([]rune(doc)) != 401 {
+		t.Errorf("expected 400 runes plus ellipsis, got %d", len([]rune(doc)))
+	}
+	if !trimmed.Points[0].PayloadTruncated || !trimmed.Points[1].PayloadTruncated {
+		t.Error("expected PayloadTruncated on trimmed points")
+	}
+	if trimmed.Points[2].PayloadTruncated {
+		t.Error("nil payload must not be marked truncated")
+	}
+	if tags, _ := trimmed.Points[1].Payload["tags"].([]interface{}); len(tags) != 2 {
+		t.Error("array length must be preserved")
+	}
+
+	untrimmed := trimPointsResponse(response, 0)
+	if untrimmed.Points[0].PayloadTruncated {
+		t.Error("zero budget must disable trimming")
+	}
+
+	if response.Points[0].Payload["document"] != long {
+		t.Error("trimPointsResponse must not mutate the input response")
+	}
+}
+
+func TestCompressionMiddleware(t *testing.T) {
+	handler := compressionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: ping\n\n")
+		case "/empty":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"ok":true,"body":"`+strings.Repeat("x", 400)+`"}`)
+		}
+	}))
+
+	t.Run("compresses when accepted", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/collections", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Content-Encoding") != "gzip" {
+			t.Fatalf("Content-Encoding = %q, want gzip", rec.Header().Get("Content-Encoding"))
+		}
+		reader, err := gzip.NewReader(rec.Body)
+		if err != nil {
+			t.Fatalf("gzip reader: %v", err)
+		}
+		decoded, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatalf("read gzip body: %v", err)
+		}
+		if !strings.Contains(string(decoded), `"ok":true`) {
+			t.Errorf("decoded body = %q", decoded)
+		}
+		if rec.Header().Get("Content-Length") != "" {
+			t.Error("compressed responses must not advertise Content-Length")
+		}
+	})
+
+	t.Run("passes through without accept-encoding", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/collections", nil))
+		if rec.Header().Get("Content-Encoding") != "" {
+			t.Error("expected uncompressed response")
+		}
+		if !strings.Contains(rec.Body.String(), `"ok":true`) {
+			t.Errorf("body = %q", rec.Body.String())
+		}
+	})
+
+	t.Run("skips event streams", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/stream", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Header().Get("Content-Encoding") != "" {
+			t.Error("SSE responses must not be compressed")
+		}
+		if !strings.Contains(rec.Body.String(), "data: ping") {
+			t.Errorf("stream body = %q", rec.Body.String())
+		}
+	})
+
+	t.Run("skips bodyless responses", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/empty", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", rec.Code)
+		}
+		if rec.Header().Get("Content-Encoding") != "" {
+			t.Error("204 responses must not be compressed")
+		}
+	})
+}
+
+func TestCollectionCatalogCachesAndReportsNamedVectors(t *testing.T) {
+	var metaRequests int32
+	qdrantStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/collections":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"result": map[string]interface{}{
+					"collections": []map[string]string{{"name": "named"}, {"name": "plain"}},
+				},
+			})
+		case r.URL.Path == "/collections/named":
+			atomic.AddInt32(&metaRequests, 1)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"result": map[string]interface{}{
+					"points_count": 42,
+					"config": map[string]interface{}{
+						"params": map[string]interface{}{
+							"vectors": map[string]interface{}{
+								"text":  map[string]interface{}{"size": 3072, "distance": "Cosine"},
+								"image": map[string]interface{}{"size": 512, "distance": "Dot"},
+							},
+						},
+					},
+				},
+			})
+		case r.URL.Path == "/collections/plain":
+			atomic.AddInt32(&metaRequests, 1)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"result": map[string]interface{}{
+					"points_count": 7,
+					"config": map[string]interface{}{
+						"params": map[string]interface{}{
+							"vectors": map[string]interface{}{"size": 768, "distance": "Cosine"},
+						},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer qdrantStub.Close()
+
+	app := &server{
+		q:               newQdrant(qdrantStub.URL, ""),
+		collectionCache: &collectionCatalogCache{ttl: time.Minute},
+		projections:     newProjectionGuard(2, time.Second),
+		flights:         newProjectionFlights(),
+	}
+
+	metas, err := app.collectionCatalog(context.Background())
+	if err != nil {
+		t.Fatalf("collectionCatalog: %v", err)
+	}
+	if len(metas) != 2 {
+		t.Fatalf("metas = %d, want 2", len(metas))
+	}
+	byName := map[string]CollectionMeta{}
+	for _, meta := range metas {
+		byName[meta.Name] = meta
+	}
+	if byName["named"].VectorSize != 3072 {
+		t.Errorf("named vector size = %d, want 3072", byName["named"].VectorSize)
+	}
+	if byName["plain"].VectorSize != 768 {
+		t.Errorf("plain vector size = %d, want 768", byName["plain"].VectorSize)
+	}
+	if !byName["named"].ProjectionReady || byName["named"].ProjectionNote != "ok" {
+		t.Errorf("named meta = %+v, want ready", byName["named"])
+	}
+	if got := atomic.LoadInt32(&metaRequests); got != 2 {
+		t.Errorf("metadata requests = %d, want 2 (no vector scroll)", got)
+	}
+
+	if _, err := app.collectionCatalog(context.Background()); err != nil {
+		t.Fatalf("second collectionCatalog: %v", err)
+	}
+	if got := atomic.LoadInt32(&metaRequests); got != 2 {
+		t.Errorf("cached catalog made %d extra requests", got-2)
+	}
+}
+
+func TestHandlePointDetail(t *testing.T) {
+	fake := newFakeQdrant(t)
+	_, mux := newTestServer(t, fake)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/collections/meta_bridge/points/p2", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%q)", rec.Code, rec.Body.String())
+	}
+	var body pointDetailResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if body.Payload["text"] != "beta document" {
+		t.Errorf("payload = %+v", body.Payload)
 	}
 }

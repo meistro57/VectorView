@@ -33,6 +33,8 @@ type config struct {
 	inlinePCAFallbackMax int
 	strictConfig         bool
 	python               string
+	catalogTTL           time.Duration
+	payloadMaxChars      int
 
 	semanticProvider  string
 	embedModel        string
@@ -81,6 +83,8 @@ func loadConfig() config {
 		inlinePCAFallbackMax:     envInt("VECTORVIEW_INLINE_PCA_MAX", 2000),
 		strictConfig:             envBool("VECTORVIEW_STRICT_CONFIG", false),
 		python:                   envOr("VECTORVIEW_PYTHON", pythonBin()),
+		catalogTTL:               time.Duration(envInt("VECTORVIEW_COLLECTIONS_TTL_SECONDS", 30)) * time.Second,
+		payloadMaxChars:          envInt("VECTORVIEW_PAYLOAD_MAX_CHARS", 400),
 		semanticProvider:         strings.ToLower(strings.TrimSpace(envOr("VECTORVIEW_SEMANTIC_PROVIDER", "auto"))),
 		embedModel:               strings.TrimSpace(envOr("VECTORVIEW_EMBED_MODEL", envOr("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"))),
 		ollamaURL:                strings.TrimSpace(envOr("VECTORVIEW_OLLAMA_URL", envOr("OLLAMA_BASE_URL", "http://localhost:11434"))),
@@ -107,6 +111,9 @@ func loadConfig() config {
 
 	if cfg.maxPoints <= 0 {
 		cfg.maxPoints = 2000
+	}
+	if cfg.catalogTTL < 0 {
+		cfg.catalogTTL = 0
 	}
 	if cfg.cacheTTLSeconds <= 0 {
 		cfg.cacheTTLSeconds = 600

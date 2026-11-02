@@ -203,6 +203,11 @@ let currentProjectionMeta = null;
 let uiEventSource = null;
 let uiEventSourceCollection = '';
 let cameraFlight = null;
+let hoverDirty = true;
+let lastHoverCheck = 0;
+let lowFpsFrames = 0;
+let qualityReduced = false;
+let colorRefreshQueued = false;
 let selectionHistory = [];
 let selectionHistoryIndex = -1;
 let bookmarks = [];
@@ -921,6 +926,15 @@ function exportScreenshot() {
   downloadCanvas(canvas, filename);
 }
 
+function scheduleColorRefresh() {
+  if (colorRefreshQueued) return;
+  colorRefreshQueued = true;
+  requestAnimationFrame(() => {
+    colorRefreshQueued = false;
+    refreshPointColors();
+  });
+}
+
 function refreshPointColors() {
   if (!particleSystem || pointClusterIndices.length === 0) return;
   const colorAttr = particleSystem.geometry.attributes.color;
@@ -1499,7 +1513,8 @@ function resizeTrailPipeline() {
 }
 
 function renderSceneWithTrails() {
-  if (!renderer || !scene || !camera || !sceneRenderTarget || !trailBlendMaterial || !trailPresentMaterial) {
+  if (!renderer || !scene || !camera || !sceneRenderTarget || !trailBlendMaterial || !trailPresentMaterial || trailPersistence <= 0.02) {
+    renderer.setRenderTarget(null);
     renderer.render(scene, camera);
     return;
   }
@@ -1598,6 +1613,7 @@ function onResize() {
 function onMouseMove(e) {
   mouse.x =  (e.clientX / window.innerWidth)  * 2 - 1;
   mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  hoverDirty = true;
 }
 
 function onClick(e) {
@@ -2116,20 +2132,22 @@ function showInspector(pt, mode = 'selected') {
     'speaker', 'memory_kind', 'project', 'source_type', 'conversation_id', 'session_id',
     'thought_id', 'memory_id', 'question', 'type', 'strategy', 'uncertainty_class',
     'importance', 'evidence_strength', 'provenance_score', 'confidence',
-    'source_quote', 'evidence_summary', 'summary', 'text', 'content', 'chunk_text',
+    'source_quote', 'evidence_summary', 'summary', 'text', 'content', 'chunk_text', 'document',
     'claims', 'concepts', 'questions', 'tags', 'sources', 'tone', 'author',
     'timestamp', 'date_basis', 'approximate_date', 'awakening_phase',
     'ai_provider', 'ai_model', 'embedding_model', 'source_id', 'source_collection',
     'source_file', 'chunk_index'
   ];
+  const longTextKeys = new Set(['text', 'content', 'chunk_text', 'document', 'source_quote', 'summary', 'evidence_summary', 'question', 'page_segment']);
   const shown = new Set();
   for (const k of priority) {
     const value = payloadLookup(payload, k);
     if (value === undefined) continue;
     const canonicalKey = k.toLowerCase();
     if (shown.has(canonicalKey)) continue;
-    const v = shortText(value, 200);
-    html += `<div class="insp-field"><div class="insp-key">${escapeHTML(k)}</div><div class="insp-val">${escapeHTML(v)}</div></div>`;
+    const long = longTextKeys.has(canonicalKey) && typeof value === 'string' && value.length > 200;
+    const v = shortText(value, long ? 1200 : 200);
+    html += `<div class="insp-field"><div class="insp-key">${escapeHTML(k)}</div><div class="insp-val${long ? ' long' : ''}">${escapeHTML(v)}</div></div>`;
     shown.add(canonicalKey);
   }
   for (const [k, v] of Object.entries(payload)) {
@@ -2526,11 +2544,31 @@ function selectPointByIndex(index, options = {}) {
     syncSimilarItemStates();
   }
   showInspector(selectedPoint, 'selected');
+  hydrateFullPayload(index);
   recordSelection(selectedPoint);
   refreshBookmarkButton();
   updateSignalButtons();
   if (similarityModeActive) {
     applySignalScanHighlight();
+  }
+}
+
+async function hydrateFullPayload(index) {
+  const point = allPoints[index];
+  if (!point || !point.payload_truncated) return;
+  const id = pointIDKey(point.id);
+  try {
+    const res = await fetch(`/api/collections/${encodeURIComponent(currentCollection)}/points/${encodeURIComponent(id)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data || !data.payload) return;
+    if (pointIDKey(point.id) !== id) return;
+    point.payload = data.payload;
+    point.payload_truncated = false;
+    if (selectedPoint === point) {
+      showInspector(selectedPoint, 'selected');
+    }
+  } catch {
   }
 }
 
@@ -2782,6 +2820,7 @@ function startUIEventStream() {
 // ── Raycasting hover ──────────────────────────────────────────────────────────
 let lastHoverIdx = -1;
 function checkHover() {
+  hoverDirty = false;
   if (!particleSystem || allPoints.length === 0) return;
   raycaster.setFromCamera(mouse, camera);
   const hits = raycaster.intersectObject(particleSystem);
@@ -2813,6 +2852,18 @@ function animate() {
   if (frameCount % 30 === 0) {
     fps = Math.round(30 / (delta * 30 + 0.0001));
     document.getElementById('stat-fps').textContent = fps;
+    if (fps > 0 && fps < 28) {
+      lowFpsFrames = Math.min(lowFpsFrames + 1, 10);
+    } else {
+      lowFpsFrames = Math.max(0, lowFpsFrames - 1);
+    }
+    if (lowFpsFrames >= 4 && !qualityReduced) {
+      qualityReduced = true;
+      if (nebulaSystem) nebulaSystem.visible = false;
+    } else if (lowFpsFrames === 0 && qualityReduced) {
+      qualityReduced = false;
+      if (nebulaSystem) nebulaSystem.visible = true;
+    }
   }
 
   if (timelineAutoPlay && allPoints.length > 0) {
@@ -2829,7 +2880,12 @@ function animate() {
   controls.setAutoRotateSpeed(rotSpeed);
   controls.update();
   stepLiveDrops(delta);
-  checkHover();
+
+  const autoRotating = controls.autoRotate && !controls._dragging;
+  if (hoverDirty || (autoRotating && now - lastHoverCheck > 100)) {
+    lastHoverCheck = now;
+    checkHover();
+  }
 
   if (particleSystem) {
     particleSystem.material.uniforms.uTime.value = now * 0.001;
@@ -3143,21 +3199,21 @@ function wireControls() {
     const v = parseFloat(e.target.value);
     hueShift = v;
     document.getElementById('val-hue').textContent = `${Math.round(v)}°`;
-    refreshPointColors();
+    scheduleColorRefresh();
   });
 
   document.getElementById('ctrl-saturation').addEventListener('input', e => {
     const v = parseFloat(e.target.value);
     saturationMult = v;
     document.getElementById('val-saturation').textContent = v.toFixed(2);
-    refreshPointColors();
+    scheduleColorRefresh();
   });
 
   document.getElementById('ctrl-lightness').addEventListener('input', e => {
     const v = parseFloat(e.target.value);
     lightnessMult = v;
     document.getElementById('val-lightness').textContent = v.toFixed(2);
-    refreshPointColors();
+    scheduleColorRefresh();
   });
 
   document.getElementById('collection-select').addEventListener('change', e => {

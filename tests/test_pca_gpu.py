@@ -205,3 +205,37 @@ class ProjectionWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BackendSelectionTests(unittest.TestCase):
+    def test_auto_keeps_small_matrices_on_numpy(self):
+        self.assertFalse(pca_gpu.uses_gpu_backend("auto", 2000 * 384, threshold=20_000_000))
+        self.assertTrue(pca_gpu.uses_gpu_backend("auto", 75_000 * 3_072, threshold=20_000_000))
+
+    def test_explicit_backends_are_honoured(self):
+        self.assertTrue(pca_gpu.uses_gpu_backend("torch", 10, threshold=20_000_000))
+        self.assertTrue(pca_gpu.uses_gpu_backend("cupy", 10, threshold=20_000_000))
+        self.assertFalse(pca_gpu.uses_gpu_backend("numpy", 10**12, threshold=20_000_000))
+
+    def test_threshold_env_override(self):
+        previous = os.environ.get("VECTORVIEW_PCA_GPU_THRESHOLD")
+        os.environ["VECTORVIEW_PCA_GPU_THRESHOLD"] = "100"
+        try:
+            self.assertEqual(pca_gpu.gpu_threshold(), 100)
+            self.assertTrue(pca_gpu.uses_gpu_backend("auto", 200))
+        finally:
+            if previous is None:
+                os.environ.pop("VECTORVIEW_PCA_GPU_THRESHOLD", None)
+            else:
+                os.environ["VECTORVIEW_PCA_GPU_THRESHOLD"] = previous
+
+    def test_invalid_threshold_falls_back_to_default(self):
+        previous = os.environ.get("VECTORVIEW_PCA_GPU_THRESHOLD")
+        os.environ["VECTORVIEW_PCA_GPU_THRESHOLD"] = "not-a-number"
+        try:
+            self.assertEqual(pca_gpu.gpu_threshold(), pca_gpu.GPU_WORK_THRESHOLD)
+        finally:
+            if previous is None:
+                os.environ.pop("VECTORVIEW_PCA_GPU_THRESHOLD", None)
+            else:
+                os.environ["VECTORVIEW_PCA_GPU_THRESHOLD"] = previous

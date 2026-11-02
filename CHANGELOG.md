@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `GET /api/collections/{collection}/points/{point_id}` returns a point's full payload, so list responses can trim long text without losing data.
+- Adaptive live-watch polling: idle collections back off from the base interval to a 30s floor, then return to base as soon as a count changes.
 - Saved lenses: named presets capturing collection, projection, point limit, named vector, theme, color field, and camera, persisted in `localStorage`, with `#lens=` share links that restore the full view on load.
 - Optional cluster legend composited into the exported screenshot (swatch, label, count, plus a `COLLECTION · PROJECTION · POINTS` caption), toggled from the top bar.
 - Web fonts (Orbitron, Share Tech Mono) are vendored under `static/fonts`, removing the last external asset request.
@@ -45,6 +47,12 @@ All notable changes to this project will be documented in this file.
 - GitHub Actions workflow (`.github/workflows/test.yml`) to run `go test ./...` on push and pull request.
 
 ### Changed
+- Performance pass: `/api/collections` now parses named-vector configs (dims were reported as 0 for 9 of 30 collections), answers from a 30s catalog cache, and probes collections in parallel instead of one at a time (1.55s → ~60ms cold, ~1ms cached against a 30-collection Qdrant).
+- API and static responses are gzip-compressed when accepted (a 2,000-point load drops from 3.2 MB to ~400 KB on the wire), with immutable cache headers for `/vendor` and `/fonts`.
+- List responses trim payload strings to `VECTORVIEW_PAYLOAD_MAX_CHARS` (default 400; the inspector only rendered 120 anyway), cutting the same 2,000-point response from 3.2 MB to 1.55 MB decoded.
+- The projection worker keeps `auto` on the numpy randomized SVD for small/medium matrices and only reaches for torch/cupy above `VECTORVIEW_PCA_GPU_THRESHOLD` rows×dims (a 2,000×384 PCA went from 0.9s to 0.2s).
+- Frontend frame budget: hover raycasts only run after pointer movement (or at 10 Hz while auto-rotating), color-slider recolors coalesce into one per frame, the trail pipeline is skipped when persistence is off, and the nebula layer hides itself while the frame rate is below ~28 FPS.
+- The inspector renders long text (up to 1,200 chars, scrollable) and hydrates the full payload for trimmed points on selection.
 - Replaced the local `max`/`minInt` helpers with Go's built-in `min`/`max`.
 - Frontend split into `static/css/app.css`, `static/js/app.js`, `static/js/shaders.js`, and `static/js/api.js`; `index.html` is now markup plus the import map (4103 → 271 lines) with no bundler or npm dependency.
 - Restored the load-progress status line, which had been dropped when the progress poller was replaced by SSE events.

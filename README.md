@@ -98,7 +98,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 ### Prerequisites
 
 - [Go 1.22+](https://golang.org/dl/)
-- [Python 3.9+](https://www.python.org/downloads/) with `numpy` installed (`torch`/`cupy` optional for GPU acceleration, `scikit-learn` optional for t-SNE mode)
+- [Python 3.9+](https://www.python.org/downloads/) with the packages from `requirements.txt` (`torch`/`cupy` optional for GPU acceleration, `scikit-learn` optional for t-SNE mode, `umap-learn` optional for UMAP mode)
 - [Qdrant](https://qdrant.tech) running locally (default: `http://localhost:6333`)
 - A populated collection to explore
 
@@ -108,7 +108,7 @@ It was born out of the [meta_bridge](https://github.com/meistro57/meta-bridge) /
 git clone https://github.com/meistro57/VectorView.git
 cd VectorView
 go mod tidy
-python3 -m pip install numpy
+python3 -m pip install -r requirements.txt
 # optional: required only for projection=tsne
 python3 -m pip install scikit-learn
 # optional: required only for projection=umap
@@ -190,6 +190,13 @@ VECTORVIEW_PYTHON=
 VECTORVIEW_INLINE_PCA_MAX=2000
 # Force a specific PCA backend in the worker: auto | torch | cupy | numpy
 VECTORVIEW_PCA_BACKEND=auto
+# Worker work threshold (rows x dims) before auto selects a GPU backend
+VECTORVIEW_PCA_GPU_THRESHOLD=20000000
+
+# Payload trimming for list responses (full text via the per-point endpoint)
+VECTORVIEW_PAYLOAD_MAX_CHARS=400
+# Collection catalog cache TTL (0 disables)
+VECTORVIEW_COLLECTIONS_TTL_SECONDS=30
 
 # Exit non-zero when the startup config report has warnings
 VECTORVIEW_STRICT_CONFIG=false
@@ -331,6 +338,10 @@ GET  /api/highlight?collection=X&since=event_id                                 
 GET  /api/stream?collection=X&heartbeat_seconds=N&replay=K&max_events_per_second=M  → SSE stream for ingest/highlight/telemetry/load_progress with optional replay + server-side throttling
 GET  /api/ws                                                                         → WebSocket heartbeat endpoint (server ping frames)
 GET  /healthz                                                                        → Qdrant reachability, cache backends, projection slot usage (no auth)
+GET  /api/collections/{collection}/points/{point_id}                                 → full payload for one point (list responses trim long text)
+
+All API responses are gzip-compressed when the client accepts it, and `/vendor/*` +
+`/fonts/*` are served with long-lived immutable cache headers.
 
 `/api/stream` notes:
 - `replay=K` replays up to `K` most recent events from Redis Streams (`VECTORVIEW_REDIS_STREAM_KEY`) before live events.

@@ -1,0 +1,14 @@
+# Core runtime requirement for the projection worker (pca_gpu.py) and its tests.
+numpy>=1.24
+
+# Optional projection backends. Uncomment the ones you need:
+# torch>=2.0            # VECTORVIEW_PCA_BACKEND=torch (GPU PCA via PyTorch)
+# cupy-cuda12x>=12.0    # VECTORVIEW_PCA_BACKEND=cupy (GPU PCA via CuPy)
+# scikit-learn>=1.3     # projection=tsne
+# umap-learn>=0.5       # projection=umap
+
+# Optional scraper tooling used by races_scraper.py (not needed by the server).
+# requests>=2.31
+# beautifulsoup4>=4.12
+# qdrant-client>=1.7
+# fastembed>=0.3

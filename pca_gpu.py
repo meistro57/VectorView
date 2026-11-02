@@ -68,13 +68,47 @@ def fetch_points(collection, limit, qdrant_url):
     return all_points[:limit]
 
 
+GPU_WORK_THRESHOLD = 20000000
+
+
+def gpu_threshold():
+    raw = os.getenv("VECTORVIEW_PCA_GPU_THRESHOLD", "").strip()
+    if not raw:
+        return GPU_WORK_THRESHOLD
+    try:
+        value = int(raw)
+    except ValueError:
+        return GPU_WORK_THRESHOLD
+    return value if value >= 0 else GPU_WORK_THRESHOLD
+
+
+def uses_gpu_backend(backend, work, threshold=None):
+    """Whether to hand this matrix to torch/cupy instead of the numpy path.
+
+    GPU acceleration only pays off once the transfer and kernel overhead is
+    amortised, so `auto` stays on numpy for small/medium collections.
+    """
+    if backend in {"torch", "cupy"}:
+        return True
+    if backend == "numpy":
+        return False
+    limit = gpu_threshold() if threshold is None else threshold
+    return work >= limit
+
+
 def pca_gpu(matrix):
     """Run PCA to 3D using GPU if available, fall back to CPU."""
     backend = os.getenv("VECTORVIEW_PCA_BACKEND", "auto").strip().lower()
     if backend not in {"auto", "torch", "cupy", "numpy"}:
         raise ValueError(f"invalid VECTORVIEW_PCA_BACKEND: {backend!r} (expected auto, torch, cupy, numpy)")
 
-    if backend in {"auto", "torch"}:
+    rows, cols = matrix.shape
+    work = rows * cols
+    take_gpu = uses_gpu_backend(backend, work)
+    if not take_gpu:
+        log(f"Matrix work {work:,} below GPU threshold {gpu_threshold():,}; using numpy")
+
+    if take_gpu and backend in {"auto", "torch"}:
         try:
             import torch
         except ImportError:
@@ -97,7 +131,7 @@ def pca_gpu(matrix):
             _, _, vt = torch.linalg.svd(t, full_matrices=False)
             return (t @ vt[:3].T).numpy()
 
-    if backend in {"auto", "cupy"}:
+    if take_gpu and backend in {"auto", "cupy"}:
         try:
             import cupy as cp
         except ImportError:

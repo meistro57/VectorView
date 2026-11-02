@@ -7,9 +7,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY main.go config.go server.go pca_gpu.py ./
+COPY *.go ./
+COPY pca_gpu.py ./
 COPY static ./static
-COPY main_test.go server_test.go ./
 
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vectorview .
 
@@ -23,7 +23,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VECTORVIEW_CACHE_DIR=/app/.cache/projections \
     VECTORVIEW_PYTHON=/usr/local/bin/python3
 
-RUN pip install --no-cache-dir numpy $INSTALL_EXTRAS
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt $INSTALL_EXTRAS
 
 WORKDIR /app
 

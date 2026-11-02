@@ -66,18 +66,58 @@ type QPoint struct {
 	Payload map[string]interface{} `json:"payload"`
 }
 
+type vectorParams struct {
+	Size     uint64 `json:"size"`
+	Distance string `json:"distance"`
+}
+
 type collectionInfo struct {
 	Result struct {
 		PointsCount uint64 `json:"points_count"`
 		Config      struct {
 			Params struct {
-				Vectors struct {
-					Size     uint64 `json:"size"`
-					Distance string `json:"distance"`
-				} `json:"vectors"`
+				Vectors json.RawMessage `json:"vectors"`
 			} `json:"params"`
 		} `json:"config"`
 	} `json:"result"`
+}
+
+func decodeVectorParams(raw json.RawMessage) (uint64, string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return 0, "", false
+	}
+
+	var single vectorParams
+	if err := json.Unmarshal(raw, &single); err == nil && single.Size > 0 {
+		return single.Size, single.Distance, true
+	}
+
+	var named map[string]vectorParams
+	if err := json.Unmarshal(raw, &named); err != nil {
+		return 0, "", false
+	}
+	counts := make(map[uint64]int, len(named))
+	distances := make(map[uint64]string, len(named))
+	for _, params := range named {
+		if params.Size == 0 {
+			continue
+		}
+		counts[params.Size]++
+		if _, seen := distances[params.Size]; !seen {
+			distances[params.Size] = params.Distance
+		}
+	}
+	bestSize, bestCount := uint64(0), 0
+	for size, count := range counts {
+		if count > bestCount || (count == bestCount && size > bestSize) {
+			bestSize, bestCount = size, count
+		}
+	}
+	if bestSize == 0 {
+		return 0, "", false
+	}
+	return bestSize, distances[bestSize], true
 }
 
 type collectionsListResult struct {
@@ -347,11 +387,12 @@ type ProjectionAxis struct {
 }
 
 type PointData struct {
-	ID      interface{}            `json:"id"`
-	X       float64                `json:"x"`
-	Y       float64                `json:"y"`
-	Z       float64                `json:"z"`
-	Payload map[string]interface{} `json:"payload"`
+	ID               interface{}            `json:"id"`
+	X                float64                `json:"x"`
+	Y                float64                `json:"y"`
+	Z                float64                `json:"z"`
+	Payload          map[string]interface{} `json:"payload"`
+	PayloadTruncated bool                   `json:"payload_truncated,omitempty"`
 }
 
 type CollectionMeta struct {
@@ -822,11 +863,12 @@ func (q *qdrantClient) collectionMeta(ctx context.Context, name string) (Collect
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return CollectionMeta{}, fmt.Errorf("collectionMeta decode: %w", err)
 	}
+	size, distance, _ := decodeVectorParams(info.Result.Config.Params.Vectors)
 	return CollectionMeta{
 		Name:           name,
 		PointsCount:    info.Result.PointsCount,
-		VectorSize:     info.Result.Config.Params.Vectors.Size,
-		DistanceMetric: info.Result.Config.Params.Vectors.Distance,
+		VectorSize:     size,
+		DistanceMetric: distance,
 	}, nil
 }
 
@@ -1378,51 +1420,77 @@ func watchCollectionStream(ctx context.Context, q *qdrantClient, hub *streamHub,
 	if collection == "" {
 		return
 	}
+	if pollInterval <= 0 {
+		pollInterval = 3 * time.Second
+	}
+	maxInterval := pollInterval * 10
+	if maxInterval < 30*time.Second {
+		maxInterval = 30 * time.Second
+	}
+
 	knownCount := 0
 	if meta, err := q.collectionMeta(ctx, collection); err == nil {
 		knownCount = int(meta.PointsCount)
 	}
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
 	warnedNotFound := false
+	idlePolls := 0
+
+	poll := func() time.Duration {
+		meta, err := q.collectionMeta(ctx, collection)
+		if err != nil {
+			if !warnedNotFound {
+				log.Printf("%s watch note: collection=%s not ready: %v", systemLabel, collection, err)
+				warnedNotFound = true
+			}
+			return maxInterval
+		}
+		warnedNotFound = false
+
+		currentCount := int(meta.PointsCount)
+		if currentCount <= knownCount {
+			idlePolls++
+			switch {
+			case idlePolls < 5:
+				return pollInterval
+			case idlePolls < 20:
+				return pollInterval * 3
+			default:
+				return maxInterval
+			}
+		}
+
+		idlePolls = 0
+		pointsToFetch := currentCount - knownCount
+		if pointsToFetch > 128 {
+			pointsToFetch = 128
+		}
+		points, err := q.fetchPointsWindow(ctx, collection, knownCount, pointsToFetch)
+		if err != nil {
+			log.Printf("%s watch error collection=%s: %v", systemLabel, collection, err)
+			return pollInterval
+		}
+		if len(points) == 0 {
+			knownCount = currentCount
+			return pollInterval
+		}
+		knownCount += len(points)
+		for _, point := range points {
+			hub.publish("point_ingested", collection, map[string]interface{}{
+				"id":      point.ID,
+				"payload": point.Payload,
+			})
+		}
+		return pollInterval
+	}
+
+	timer := time.NewTimer(pollInterval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			meta, err := q.collectionMeta(ctx, collection)
-			if err != nil {
-				if !warnedNotFound {
-					log.Printf("%s watch note: collection=%s not ready: %v", systemLabel, collection, err)
-					warnedNotFound = true
-				}
-				continue
-			}
-			warnedNotFound = false
-			currentCount := int(meta.PointsCount)
-			if currentCount <= knownCount {
-				continue
-			}
-			pointsToFetch := currentCount - knownCount
-			if pointsToFetch > 128 {
-				pointsToFetch = 128
-			}
-			points, err := q.fetchPointsWindow(ctx, collection, knownCount, pointsToFetch)
-			if err != nil {
-				log.Printf("%s watch error collection=%s: %v", systemLabel, collection, err)
-				continue
-			}
-			if len(points) == 0 {
-				knownCount = currentCount
-				continue
-			}
-			knownCount += len(points)
-			for _, point := range points {
-				hub.publish("point_ingested", collection, map[string]interface{}{
-					"id":      point.ID,
-					"payload": point.Payload,
-				})
-			}
+		case <-timer.C:
+			timer.Reset(poll())
 		}
 	}
 }
@@ -1689,6 +1757,92 @@ func writeServerError(w http.ResponseWriter, status int, code, message string, c
 	writeJSONError(w, status, code, message)
 }
 
+func truncateText(value string, maxChars int) string {
+	if maxChars <= 0 || len(value) <= maxChars {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= maxChars {
+		return value
+	}
+	return string(runes[:maxChars]) + "…"
+}
+
+func trimPayloadValue(value interface{}, maxChars int) (interface{}, bool) {
+	switch typed := value.(type) {
+	case string:
+		trimmed := truncateText(typed, maxChars)
+		return trimmed, trimmed != typed
+	case map[string]interface{}:
+		var out map[string]interface{}
+		for key, nested := range typed {
+			trimmed, changed := trimPayloadValue(nested, maxChars)
+			if !changed {
+				if out != nil {
+					out[key] = nested
+				}
+				continue
+			}
+			if out == nil {
+				out = make(map[string]interface{}, len(typed))
+				for otherKey, otherValue := range typed {
+					if otherKey != key {
+						out[otherKey] = otherValue
+					}
+				}
+			}
+			out[key] = trimmed
+		}
+		if out == nil {
+			return typed, false
+		}
+		return out, true
+	case []interface{}:
+		var out []interface{}
+		for index, nested := range typed {
+			trimmed, changed := trimPayloadValue(nested, maxChars)
+			if !changed {
+				if out != nil {
+					out[index] = nested
+				}
+				continue
+			}
+			if out == nil {
+				out = make([]interface{}, len(typed))
+				copy(out, typed)
+			}
+			out[index] = trimmed
+		}
+		if out == nil {
+			return typed, false
+		}
+		return out, true
+	default:
+		return value, false
+	}
+}
+
+func trimPointsResponse(value PointsResponse, maxChars int) PointsResponse {
+	if maxChars <= 0 || len(value.Points) == 0 {
+		return value
+	}
+	out := value
+	out.Points = make([]PointData, len(value.Points))
+	for index, point := range value.Points {
+		trimmedPoint := point
+		if point.Payload != nil {
+			if trimmed, changed := trimPayloadValue(point.Payload, maxChars); changed {
+				if payload, ok := trimmed.(map[string]interface{}); ok {
+					trimmedPoint.Payload = payload
+				}
+				trimmedPoint.PayloadTruncated = true
+			}
+		}
+		out.Points[index] = trimmedPoint
+	}
+	return out
+}
+
 func writeProjectionError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errProjectionBusy) {
 		writeJSONError(w, http.StatusTooManyRequests, errCodeSaturated, "too many projections in flight, retry shortly")
@@ -1837,7 +1991,7 @@ func main() {
 
 	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           newAuthMiddleware(cfg.authToken, mux),
+		Handler:           compressionMiddleware(newAuthMiddleware(cfg.authToken, mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,

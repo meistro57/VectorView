@@ -23,7 +23,7 @@
 
 ### Direct Commands Seen in README
 - `go mod tidy`
-- `python3 -m pip install numpy`
+- `python3 -m pip install -r requirements.txt`
 - `go run .`
 - `go build -o vectorview .`
 
@@ -51,6 +51,9 @@
   - `VECTORVIEW_INLINE_PCA_MAX` (default `2000`, point ceiling for the inline Go PCA fallback)
   - `VECTORVIEW_PCA_BACKEND` (worker PCA backend: `auto`, `torch`, `cupy`, `numpy`; also read by `tests/test_pca_gpu.py`)
   - `VECTORVIEW_STRICT_CONFIG` (default `false`, exit non-zero when the boot config report warns)
+  - `VECTORVIEW_PCA_GPU_THRESHOLD` (default `20000000`; `auto` stays on numpy below this rows×dims work)
+  - `VECTORVIEW_PAYLOAD_MAX_CHARS` (default `400`, trims long payload strings in list responses)
+  - `VECTORVIEW_COLLECTIONS_TTL_SECONDS` (default `30`, catalog cache; `0` disables)
   - `VECTORVIEW_TOKEN` (optional; when set, `/api/*` requires `Authorization: Bearer <token>`, `X-VectorView-Token`, or `?token=`)
   - `VECTORVIEW_SEMANTIC_PROVIDER` (default `auto`, supports `auto`, `ollama`, `openrouter`, `openai`)
   - `VECTORVIEW_OLLAMA_URL` (default `http://localhost:11434`)
@@ -79,6 +82,7 @@
    - `GET /api/semantic-search?collection=&target_collection=&q=&limit=&projection=&vector_name=`
    - `GET /api/highlight?collection=&since=` (one-shot catch-up for external highlight triggers; live updates arrive over `/api/stream`)
    - `GET /healthz` (Qdrant reachability, cache backends, projection slot usage)
+   - `GET /api/collections/{collection}/points/{point_id}` (full payload for one point)
 3. Backend talks to Qdrant using raw HTTP (`/collections`, `/collections/{name}`, `/collections/{name}/points/scroll`, `/collections/{name}/points/search`).
 
 ### Projection paths (important)
@@ -95,7 +99,9 @@
 ## Conventions and Patterns Observed
 - Go style is `gofmt`-compatible with tabs and minimal abstraction.
 - Qdrant access is via handwritten structs and `encoding/json`, not an SDK.
-- Handlers call `setCORS(w)` and generally write JSON directly with `json.NewEncoder`.
+- Handlers call `setCORS(w)` and write JSON via `writeJSONValue` / `writeJSONError`.
+- `compressionMiddleware` gzips API and static responses (skips SSE/ws, HEAD, Range, and 204/304); `staticFileHandler` adds immutable cache headers for `/vendor` and `/fonts`.
+- The collection catalog is probed in parallel (8 workers) and cached for `VECTORVIEW_COLLECTIONS_TTL_SECONDS`; the 64-point vector scroll only runs when the collection config does not report a dense vector size.
 - Keyword search uses Qdrant `scroll` + `filter.should` over multiple payload keys and case variants across meta_bridge and FrontPocket fields.
 - Semantic search auto-detects embedding provider and model per collection (OpenRouter for FrontPocket 3072 dims, Ollama for meta_bridge 768 dims, OpenAI for 1536 dims).
 - `/api/highlight` (`POST`) stores in-memory highlight events (`ids`, optional `focus_id`) per collection for UI polling.
@@ -133,3 +139,4 @@
 - `.github/workflows/test.yml` — CI test workflow (`go test ./...`)
 - `Makefile` — canonical developer shortcuts
 - `.env.example` — runtime configuration template
+- `requirements.txt` — Python dependencies (core `numpy`, optional projection backends commented out)
